@@ -1,7 +1,13 @@
 import AppKit
 import Foundation
 
-struct FinderBridge {
+protocol FinderBridging {
+    func reveal(path: String)
+    func openFolder(path: String)
+    func open(path: String)
+}
+
+struct FinderBridge: FinderBridging {
     func reveal(path: String) {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }

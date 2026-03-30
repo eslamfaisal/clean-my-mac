@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 
 APP_NAME="CleanMyMac"
 BUNDLE_ID="com.eslam.cleanmymac"
-VERSION="0.0.1"
+VERSION="0.0.2"
 MIN_MACOS="14.0"
 BUILD_DIR="$ROOT_DIR/.build"
 RELEASE_DIR="$BUILD_DIR/arm64-apple-macosx/release"

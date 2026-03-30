@@ -1,6 +1,12 @@
 import Foundation
 
-actor HistoryStore {
+protocol HistoryStoring: Sendable {
+    func load() async -> HistoryStore.PersistedState
+    func save(rules: [UserRule], entries: [ScanHistoryEntry]) async
+    func append(entry: ScanHistoryEntry, existingRules: [UserRule], existingEntries: [ScanHistoryEntry]) async -> [ScanHistoryEntry]
+}
+
+actor HistoryStore: HistoryStoring {
     struct PersistedState: Codable, Sendable {
         var rules: [UserRule]
         var entries: [ScanHistoryEntry]
@@ -17,8 +23,10 @@ actor HistoryStore {
     private let stateURL: URL
 
     init(folderName: String = "CleanMyMac") {
-        let baseURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appending(path: folderName, directoryHint: .isDirectory)
+        let fm = FileManager.default
+        let appSupportURL = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.temporaryDirectory
+        let baseURL = appSupportURL.appending(path: folderName, directoryHint: .isDirectory)
         self.stateURL = baseURL.appending(path: "history-state.json")
     }
 

@@ -5,6 +5,7 @@ struct AppShellView: View {
     @ObservedObject var viewModel: AppViewModel
     @AppStorage("layout.sidebarVisible") private var isSidebarVisible = true
     @AppStorage("layout.inspectorVisible") private var isInspectorVisible = true
+    @State private var isPermissionAlertPresented = false
 
     var body: some View {
         ZStack {
@@ -74,6 +75,15 @@ struct AppShellView: View {
                     if viewModel.isScanning {
                         ToolbarStatusView(viewModel: viewModel, showsDisclosure: false)
                             .frame(width: 290)
+                    } else if viewModel.permissionSnapshot.requiresAttention {
+                        Button {
+                            isPermissionAlertPresented = true
+                        } label: {
+                            ToolbarStatusView(viewModel: viewModel, showsDisclosure: false)
+                                .frame(width: 290)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Click to see permission details")
                     } else {
                         Menu {
                             Section("Start Scan") {
@@ -157,6 +167,15 @@ struct AppShellView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             viewModel.refreshPermissions()
+        }
+        .alert("Full Disk Access Required", isPresented: $isPermissionAlertPresented) {
+            Button("Open System Settings") {
+                viewModel.openSystemSettings(for: .fullDiskAccess)
+            }
+            .keyboardShortcut(.defaultAction)
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("CleanMyMac needs Full Disk Access to inspect protected caches, logs, and developer artifacts.\n\nOpen System Settings → Privacy & Security → Full Disk Access and enable this app.")
         }
     }
 

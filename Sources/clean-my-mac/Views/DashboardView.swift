@@ -2,6 +2,8 @@ import SwiftUI
 
 struct DashboardView: View {
     @ObservedObject var viewModel: AppViewModel
+    @State private var heroAppeared = false
+    @State private var scanBorderPhase: CGFloat = 0
 
     var body: some View {
         GeometryReader { proxy in
@@ -247,10 +249,14 @@ struct DashboardView: View {
                 .font(.system(size: 34, weight: .bold, design: .rounded))
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)
+                .opacity(heroAppeared ? 1 : 0)
+                .offset(y: heroAppeared ? 0 : 12)
 
             Text("The scanner prioritizes build artifacts, dependency caches, logs, installers, and large files. Nothing is deleted until you approve it.")
                 .font(.title3)
                 .foregroundStyle(.secondary)
+                .opacity(heroAppeared ? 1 : 0)
+                .offset(y: heroAppeared ? 0 : 8)
 
             HStack(spacing: 12) {
                 Button(viewModel.isScanning ? "Cancel Scan" : "Scan Mac") {
@@ -263,15 +269,26 @@ struct DashboardView: View {
                 }
                 .buttonStyle(.bordered)
             }
+            .opacity(heroAppeared ? 1 : 0)
+            .offset(y: heroAppeared ? 0 : 6)
+        }
+        .onAppear {
+            withAnimation(.spring(response: 0.65, dampingFraction: 0.82).delay(0.1)) {
+                heroAppeared = true
+            }
         }
     }
 
     private var flowPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
             if viewModel.isScanning {
-                Text("Live Scan")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
+                HStack {
+                    Text("Live Scan")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    ScanPulsingDot()
+                }
 
                 HStack {
                     TagPill(title: viewModel.activeScanApproach.title, tint: AppPalette.secondaryAccent)
@@ -295,6 +312,31 @@ struct DashboardView: View {
                     Spacer()
                     statItem("\((viewModel.scanProgress?.matchedItems ?? 0).formatted()) flagged")
                 }
+
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.78)) {
+                        viewModel.cancelScan()
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "stop.circle.fill")
+                            .font(.system(size: 13, weight: .bold))
+                        Text("Cancel Scan")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                    }
+                    .foregroundStyle(AppPalette.warning)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(AppPalette.warning.opacity(0.10))
+                            .overlay(
+                                Capsule(style: .continuous)
+                                    .strokeBorder(AppPalette.warning.opacity(0.25), lineWidth: 1)
+                            )
+                    )
+                }
+                .buttonStyle(.plain)
             } else {
                 Text("Flow")
                     .font(.headline)
@@ -305,7 +347,48 @@ struct DashboardView: View {
                 flowRow(index: "04", title: "Clean Selected", detail: "Move approved items to Trash with failure handling.")
             }
         }
-        .glassCard()
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [AppPalette.surfaceRaised.opacity(0.96), AppPalette.surface.opacity(0.94)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 26, style: .continuous)
+                        .strokeBorder(
+                            viewModel.isScanning
+                                ? AnyShapeStyle(
+                                    AngularGradient(
+                                        colors: [
+                                            AppPalette.secondaryAccent.opacity(0.28),
+                                            AppPalette.accent.opacity(0.10),
+                                            AppPalette.secondaryAccent.opacity(0.04),
+                                            AppPalette.accent.opacity(0.28),
+                                            AppPalette.secondaryAccent.opacity(0.10),
+                                        ],
+                                        center: .center,
+                                        angle: .degrees(scanBorderPhase)
+                                    )
+                                )
+                                : AnyShapeStyle(AppPalette.outline),
+                            lineWidth: viewModel.isScanning ? 1.5 : 1
+                        )
+                )
+        )
+        .shadow(color: AppPalette.deepSurface, radius: 24, y: 12)
+        .onChange(of: viewModel.isScanning) { _, scanning in
+            if scanning {
+                withAnimation(.linear(duration: 3.5).repeatForever(autoreverses: false)) {
+                    scanBorderPhase = 360
+                }
+            } else {
+                scanBorderPhase = 0
+            }
+        }
     }
 
     private func metricColumns(for width: CGFloat) -> [GridItem] {

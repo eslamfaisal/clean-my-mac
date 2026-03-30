@@ -468,16 +468,17 @@ final class AppViewModel: ObservableObject {
         guard let plan = cleanupPlan else { return }
         isCleanupSheetPresented = false
 
-        Task { [weak self] in
-            guard let self else { return }
-            let result = cleanupCoordinator.execute(plan: plan)
-            await MainActor.run {
+        let coordinator = cleanupCoordinator
+        Task.detached {
+            let result = coordinator.execute(plan: plan)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
                 let succeededIDs = Set(
                     plan.items
                         .filter { result.succeededPaths.contains($0.path) }
                         .map(\.id)
                 )
-                applyCleanupResult(result, removedIDs: succeededIDs)
+                self.applyCleanupResult(result, removedIDs: succeededIDs)
             }
         }
     }
