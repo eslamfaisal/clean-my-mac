@@ -64,6 +64,9 @@ struct CleanupCoordinator: CleanupCoordinating {
         if items.contains(where: { $0.category == .largeFiles }) {
             warnings.append("Large files are surfaced for review. Verify ownership before sending them to Trash.")
         }
+        if items.contains(where: { $0.sizing == .estimatedFastFolder }) {
+            warnings.append("Some generated folders use an estimated size because the scanner skipped deep descendant traversal for performance.")
+        }
         return warnings
     }
 }

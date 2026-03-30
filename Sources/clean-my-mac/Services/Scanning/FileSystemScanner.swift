@@ -13,6 +13,17 @@ struct FileSystemScanner: ScanStreaming, Sendable {
         self.classifier = ScanClassifier(configuration: configuration)
     }
 
+    private struct DirectoryMetrics {
+        let byteSize: Int64
+        let sizing: ScanItemSizing
+        let childCount: Int?
+    }
+
+    private struct FolderEstimatePolicy {
+        let minimumBytes: Int64
+        let averageBytesPerEntry: Int64
+    }
+
     func scan(target: ScanTarget, rules: [UserRule]) -> AsyncThrowingStream<ScanEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [configuration, classifier] in
@@ -56,6 +67,7 @@ struct FileSystemScanner: ScanStreaming, Sendable {
             .fileSizeKey,
             .totalFileAllocatedSizeKey,
             .fileAllocatedSizeKey,
+            .directoryEntryCountKey,
             .contentModificationDateKey,
             .contentAccessDateKey,
             .creationDateKey,
@@ -112,8 +124,13 @@ struct FileSystemScanner: ScanStreaming, Sendable {
 
                 if isDirectory {
                     if let decision = classifier.classifyDirectory(at: url, rules: rules) {
-                        let size = try directorySize(at: url, fileManager: fileManager)
-                        guard size > 0 else {
+                        let metrics = try directoryMetrics(
+                            at: url,
+                            values: values,
+                            fileManager: fileManager,
+                            decision: decision
+                        )
+                        guard metrics.byteSize > 0 else {
                             enumerator.skipDescendants()
                             continue
                         }
@@ -123,14 +140,16 @@ struct FileSystemScanner: ScanStreaming, Sendable {
                             id: url.standardizedFileURL.path,
                             path: url.standardizedFileURL.path,
                             kind: kind,
-                            byteSize: size,
+                            byteSize: metrics.byteSize,
                             lastUsedDate: values?.contentAccessDate,
                             modifiedDate: values?.contentModificationDate,
                             toolchain: decision.toolchain,
                             category: decision.category,
                             risk: decision.risk,
                             recommendation: decision.recommendation,
-                            reason: decision.reason
+                            reason: decision.reason,
+                            sizing: metrics.sizing,
+                            capturedChildCount: metrics.childCount
                         )
 
                         if itemsByPath[item.path] == nil {
@@ -153,7 +172,7 @@ struct FileSystemScanner: ScanStreaming, Sendable {
                     continue
                 }
 
-                let size = Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? values?.fileSize ?? 0)
+                let size = fileByteSize(at: url, values: values, fileManager: fileManager)
                 guard size > 0 else { continue }
 
                 if let decision = classifier.classifyFile(at: url, size: size, modifiedAt: values?.contentModificationDate ?? values?.creationDate, rules: rules) {
@@ -223,8 +242,126 @@ struct FileSystemScanner: ScanStreaming, Sendable {
             try Task.checkCancellation()
             let values = try? nestedURL.resourceValues(forKeys: resourceKeys)
             guard values?.isRegularFile == true else { continue }
-            total += Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? values?.fileSize ?? 0)
+            total += fileByteSize(at: nestedURL, values: values, fileManager: fileManager)
         }
         return total
+    }
+
+    private static func directoryMetrics(
+        at url: URL,
+        values: URLResourceValues?,
+        fileManager: FileManager,
+        decision: ClassificationDecision
+    ) throws -> DirectoryMetrics {
+        switch decision.directorySizing {
+        case .recursiveExact:
+            let size = try directorySize(at: url, fileManager: fileManager)
+            return DirectoryMetrics(
+                byteSize: size,
+                sizing: .exact,
+                childCount: values?.directoryEntryCount
+            )
+
+        case .estimatedFastFolder:
+            return try fastDirectoryEstimate(
+                at: url,
+                values: values,
+                fileManager: fileManager,
+                decision: decision
+            )
+        }
+    }
+
+    private static func fastDirectoryEstimate(
+        at url: URL,
+        values: URLResourceValues?,
+        fileManager: FileManager,
+        decision: ClassificationDecision
+    ) throws -> DirectoryMetrics {
+        try Task.checkCancellation()
+
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .fileSizeKey,
+            .fileAllocatedSizeKey,
+            .totalFileAllocatedSizeKey,
+        ]
+
+        let childURLs = (try? fileManager.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: []
+        )) ?? []
+
+        var directFileBytes: Int64 = 0
+        for childURL in childURLs {
+            try Task.checkCancellation()
+            let childValues = try? childURL.resourceValues(forKeys: resourceKeys)
+            guard childValues?.isRegularFile == true else { continue }
+            directFileBytes += fileByteSize(at: childURL, values: childValues, fileManager: fileManager)
+        }
+
+        let childCount = values?.directoryEntryCount ?? childURLs.count
+        let policy = folderEstimatePolicy(for: url, decision: decision)
+        var estimatedBytes = directFileBytes
+
+        if childCount > 0 {
+            estimatedBytes = max(estimatedBytes, Int64(childCount) * policy.averageBytesPerEntry)
+            estimatedBytes = max(estimatedBytes, policy.minimumBytes)
+        }
+
+        return DirectoryMetrics(
+            byteSize: estimatedBytes,
+            sizing: .estimatedFastFolder,
+            childCount: childCount > 0 ? childCount : nil
+        )
+    }
+
+    private static func folderEstimatePolicy(for url: URL, decision: ClassificationDecision) -> FolderEstimatePolicy {
+        let name = url.lastPathComponent.lowercased()
+        let path = url.standardizedFileURL.path.lowercased()
+
+        if name == "node_modules" {
+            return FolderEstimatePolicy(minimumBytes: 256 * 1_024 * 1_024, averageBytesPerEntry: 2 * 1_024 * 1_024)
+        }
+
+        if name == "deriveddata" || path.contains("/library/developer/xcode/deriveddata") {
+            return FolderEstimatePolicy(minimumBytes: 768 * 1_024 * 1_024, averageBytesPerEntry: 48 * 1_024 * 1_024)
+        }
+
+        if [".gradle", ".dart_tool", ".pub-cache", ".pnpm-store", ".npm", ".yarn", ".terraform", ".terragrunt-cache", ".turbo", ".parcel-cache", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox"].contains(name) {
+            return FolderEstimatePolicy(minimumBytes: 96 * 1_024 * 1_024, averageBytesPerEntry: 8 * 1_024 * 1_024)
+        }
+
+        if [".build", "build", "dist", "out", "release", "debug", "target", "flutter_build", "intermediates", ".cxx", ".next", ".nuxt", ".svelte-kit", ".output", "storybook-static", "bazel-out", "bazel-bin", "bazel-testlogs", "cmakefiles"].contains(name) || name.hasPrefix("cmake-build-") {
+            return FolderEstimatePolicy(minimumBytes: 192 * 1_024 * 1_024, averageBytesPerEntry: 24 * 1_024 * 1_024)
+        }
+
+        if name == "pods" {
+            return FolderEstimatePolicy(minimumBytes: 160 * 1_024 * 1_024, averageBytesPerEntry: 6 * 1_024 * 1_024)
+        }
+
+        if name == ".venv" || name == "venv" {
+            return FolderEstimatePolicy(minimumBytes: 128 * 1_024 * 1_024, averageBytesPerEntry: 10 * 1_024 * 1_024)
+        }
+
+        switch decision.category {
+        case .buildArtifacts:
+            return FolderEstimatePolicy(minimumBytes: 128 * 1_024 * 1_024, averageBytesPerEntry: 16 * 1_024 * 1_024)
+        case .devCaches:
+            return FolderEstimatePolicy(minimumBytes: 64 * 1_024 * 1_024, averageBytesPerEntry: 8 * 1_024 * 1_024)
+        default:
+            return FolderEstimatePolicy(minimumBytes: 16 * 1_024 * 1_024, averageBytesPerEntry: 1 * 1_024 * 1_024)
+        }
+    }
+
+    private static func fileByteSize(at url: URL, values: URLResourceValues?, fileManager: FileManager) -> Int64 {
+        let resourceValueSize = Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? values?.fileSize ?? 0)
+        if resourceValueSize > 0 {
+            return resourceValueSize
+        }
+
+        let attributes = try? fileManager.attributesOfItem(atPath: url.path)
+        return Int64((attributes?[.size] as? NSNumber)?.int64Value ?? 0)
     }
 }

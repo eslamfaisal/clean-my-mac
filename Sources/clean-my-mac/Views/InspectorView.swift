@@ -27,7 +27,10 @@ struct InspectorView: View {
 
                     detailRow("Category", value: item.category.title)
                     detailRow("Folder", value: item.folderPath)
-                    detailRow("Size", value: item.byteSize.byteString)
+                    detailRow("Size", value: item.sizeDisplayString)
+                    if item.sizing != .exact {
+                        detailRow("Scan Mode", value: item.scanCaptureDescription)
+                    }
                     detailRow("Risk", value: item.risk.title)
                     detailRow("Toolchain", value: item.toolchain ?? "General")
                     detailRow("Last Used", value: item.lastUsedDate.map(AppFormatting.absoluteDate(_:)) ?? "Unknown")

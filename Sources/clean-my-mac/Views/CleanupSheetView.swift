@@ -52,7 +52,7 @@ struct CleanupSheetView: View {
                             Text(item.category.title)
                         }
                         TableColumn("Size") { item in
-                            Text(item.byteSize.byteString)
+                            Text(item.sizeDisplayString)
                                 .fontWeight(.semibold)
                         }
                         TableColumn("Folder") { item in

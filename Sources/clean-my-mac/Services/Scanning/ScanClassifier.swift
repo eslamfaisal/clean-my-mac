@@ -1,5 +1,10 @@
 import Foundation
 
+enum DirectorySizingStrategy: Sendable {
+    case recursiveExact
+    case estimatedFastFolder
+}
+
 struct ClassificationDecision: Sendable {
     let category: ScanCategory
     let risk: ScanRisk
@@ -7,6 +12,7 @@ struct ClassificationDecision: Sendable {
     let toolchain: String?
     let reason: String
     let captureDirectory: Bool
+    let directorySizing: DirectorySizingStrategy
 }
 
 struct ScanClassifier: Sendable {
@@ -37,7 +43,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .recommended,
                 toolchain: inferredToolchain(for: lowercasedPath, default: nil),
                 reason: "Log directories often accumulate stale diagnostic files.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -49,7 +56,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .recommended,
                 toolchain: nil,
                 reason: "Items already live in Trash and are usually safe to clear.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -74,7 +82,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .review,
                 toolchain: inferredToolchain(for: lowercasedPath, default: "Application Build"),
                 reason: "Packaged application output is typically reproducible from the project, but may still be needed for shipping, QA, or rollback.",
-                captureDirectory: false
+                captureDirectory: false,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -86,7 +95,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .review,
                 toolchain: nil,
                 reason: "Installer and archive files are often safe to remove after use, but confirm you no longer need them for setup or rollback.",
-                captureDirectory: false
+                captureDirectory: false,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -98,7 +108,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .recommended,
                 toolchain: inferredToolchain(for: lowercasedPath, default: nil),
                 reason: "Log files usually provide temporary diagnostic value only.",
-                captureDirectory: false
+                captureDirectory: false,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -110,7 +121,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .review,
                 toolchain: inferredToolchain(for: lowercasedPath, default: "Build Artifact"),
                 reason: "Archive output is often restorable, but confirm it is no longer needed.",
-                captureDirectory: false
+                captureDirectory: false,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -122,7 +134,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .review,
                 toolchain: inferredToolchain(for: lowercasedPath, default: nil),
                 reason: "This file exceeds the large-file threshold and deserves review.",
-                captureDirectory: false
+                captureDirectory: false,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -135,7 +148,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .review,
                 toolchain: inferredToolchain(for: lowercasedPath, default: nil),
                 reason: "This file has not been modified in over six months.",
-                captureDirectory: false
+                captureDirectory: false,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -147,7 +161,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .review,
                 toolchain: nil,
                 reason: "Temporary and backup-style files often linger after manual workflows.",
-                captureDirectory: false
+                captureDirectory: false,
+                directorySizing: .recursiveExact
             )
         }
 
@@ -162,7 +177,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .recommended,
                 toolchain: "Xcode",
                 reason: "Xcode DerivedData can be rebuilt automatically.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -189,19 +205,21 @@ struct ScanClassifier: Sendable {
                 recommendation: .recommended,
                 toolchain: inferredToolchain(for: lowercasedPath, default: "Build System"),
                 reason: "Generated build output can be recreated by the toolchain when needed.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
         if buildArtifactDirectoryNames.contains(name) {
-            let recommendation: ScanRecommendation = name == "build" || name == "target" || name == "dist" ? .review : .recommended
+            let recommendation: ScanRecommendation = ["bin", "archive", "archives"].contains(name) ? .review : .recommended
             return ClassificationDecision(
                 category: .buildArtifacts,
                 risk: recommendation == .recommended ? .low : .medium,
                 recommendation: recommendation,
                 toolchain: inferredToolchain(for: lowercasedPath, default: "Project Output"),
                 reason: "Known generated output folder. The scanner captures the folder once and skips its descendants to avoid noisy results.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -213,10 +231,11 @@ struct ScanClassifier: Sendable {
             return ClassificationDecision(
                 category: .devCaches,
                 risk: .medium,
-                recommendation: .review,
+                recommendation: .recommended,
                 toolchain: "Node.js",
                 reason: "Dependency folders can be restored with a package install. The scanner captures the folder once and skips nested packages.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -227,7 +246,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .recommended,
                 toolchain: "Flutter",
                 reason: "Flutter and Dart tool state can be regenerated from project metadata and package resolution.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -238,7 +258,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .recommended,
                 toolchain: "Gradle",
                 reason: "Gradle caches and wrapper state can be restored on demand.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -249,7 +270,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .review,
                 toolchain: "CocoaPods",
                 reason: "Pods are generated from your Podfile and lockfile, but active iOS projects may still rely on the checked-in folder.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -260,7 +282,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .recommended,
                 toolchain: inferredToolchain(for: lowercasedPath, default: "Developer Cache"),
                 reason: "Tool-generated cache data can usually be rebuilt automatically.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -271,7 +294,8 @@ struct ScanClassifier: Sendable {
                 recommendation: .review,
                 toolchain: "Python",
                 reason: "Python virtual environments are reproducible, but many active projects rely on them locally.",
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -300,7 +324,8 @@ struct ScanClassifier: Sendable {
                 recommendation: match.4,
                 toolchain: match.1,
                 reason: match.2,
-                captureDirectory: true
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
             )
         }
 

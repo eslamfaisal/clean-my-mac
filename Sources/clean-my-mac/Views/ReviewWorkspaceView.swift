@@ -234,7 +234,7 @@ struct ReviewWorkspaceView: View {
             }
 
             cell(width: sizeColumnWidth, alignment: .trailing) {
-                Text(item.byteSize.byteString)
+                Text(item.sizeDisplayString)
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .frame(maxWidth: .infinity, alignment: .trailing)

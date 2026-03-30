@@ -211,7 +211,7 @@ struct DashboardView: View {
                             Spacer()
 
                             VStack(alignment: .trailing, spacing: 4) {
-                                Text(item.byteSize.byteString)
+                                Text(item.sizeDisplayString)
                                     .font(.headline)
                                     .foregroundStyle(.primary)
                                 Text(item.category.title)

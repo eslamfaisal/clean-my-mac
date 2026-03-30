@@ -303,6 +303,20 @@ enum ScanItemKind: String, Codable, Sendable {
     case package
 }
 
+enum ScanItemSizing: String, Codable, Sendable {
+    case exact
+    case estimatedFastFolder
+
+    var title: String {
+        switch self {
+        case .exact:
+            return "Exact"
+        case .estimatedFastFolder:
+            return "Estimated Fast Folder"
+        }
+    }
+}
+
 struct ScanItem: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let path: String
@@ -315,6 +329,38 @@ struct ScanItem: Identifiable, Codable, Hashable, Sendable {
     let risk: ScanRisk
     let recommendation: ScanRecommendation
     let reason: String
+    let sizing: ScanItemSizing
+    let capturedChildCount: Int?
+
+    init(
+        id: String,
+        path: String,
+        kind: ScanItemKind,
+        byteSize: Int64,
+        lastUsedDate: Date?,
+        modifiedDate: Date?,
+        toolchain: String?,
+        category: ScanCategory,
+        risk: ScanRisk,
+        recommendation: ScanRecommendation,
+        reason: String,
+        sizing: ScanItemSizing = .exact,
+        capturedChildCount: Int? = nil
+    ) {
+        self.id = id
+        self.path = path
+        self.kind = kind
+        self.byteSize = byteSize
+        self.lastUsedDate = lastUsedDate
+        self.modifiedDate = modifiedDate
+        self.toolchain = toolchain
+        self.category = category
+        self.risk = risk
+        self.recommendation = recommendation
+        self.reason = reason
+        self.sizing = sizing
+        self.capturedChildCount = capturedChildCount
+    }
 
     var name: String {
         URL(fileURLWithPath: path).lastPathComponent
@@ -334,6 +380,27 @@ struct ScanItem: Identifiable, Codable, Hashable, Sendable {
 
     var isDirectory: Bool {
         kind != .file
+    }
+
+    var sizeDisplayString: String {
+        switch sizing {
+        case .exact:
+            return byteSize.byteString
+        case .estimatedFastFolder:
+            return "Est. \(byteSize.byteString)"
+        }
+    }
+
+    var scanCaptureDescription: String {
+        switch sizing {
+        case .exact:
+            return "Exact size"
+        case .estimatedFastFolder:
+            if let capturedChildCount {
+                return "Fast folder estimate from \(capturedChildCount.formatted()) top-level entries"
+            }
+            return "Fast folder estimate"
+        }
     }
 }
 
