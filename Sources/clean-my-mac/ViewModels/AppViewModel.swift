@@ -2,6 +2,14 @@ import Foundation
 import SwiftUI
 import AppKit
 
+struct ScanCompletionPresentation: Identifiable, Equatable {
+    let id = UUID()
+    let approach: ScanApproach
+    let itemCount: Int
+    let totalBytes: Int64
+    let categoryCount: Int
+}
+
 enum AppSection: String, CaseIterable, Identifiable {
     case dashboard
     case review
@@ -73,6 +81,7 @@ final class AppViewModel: ObservableObject {
     @Published var isCleanupSheetPresented = false
     @Published var isScanSetupPresented = false
     @Published var lastCleanupResult: CleanupResult?
+    @Published var scanCompletionPresentation: ScanCompletionPresentation?
     @Published var statusMessage = "Ready to inspect your Mac."
 
     private let permissionCenter: PermissionProviding
@@ -85,7 +94,13 @@ final class AppViewModel: ObservableObject {
     private var preScanState: PreScanState?
     private var cleanupSheetSource: CleanupSheetSource?
     private var pendingScanItems: [ScanItem] = []
-    private let scanPublishBatchSize = 80
+    private let scanPublishBatchSize = 160
+    private let scanPublishInterval: TimeInterval = 0.18
+    private let progressPublishInterval: TimeInterval = 0.12
+    private var lastScanItemsFlushAt: TimeInterval = 0
+    private var lastPublishedProgressAt: TimeInterval = 0
+    private var lastPublishedProgressPhase: ScanPhase?
+    private var completionPresentationTask: Task<Void, Never>?
 
     init(
         permissionCenter: PermissionProviding = PermissionCenter(),
@@ -182,6 +197,70 @@ final class AppViewModel: ObservableObject {
         return permissionSnapshot.requiresAttention ? "Grant Full Disk Access to scan protected folders" : "Run a full-disk cleanup scan"
     }
 
+    var scanPhaseTitle: String {
+        guard let progress = scanProgress else {
+            return scanSnapshot == nil ? "Standby" : "Results ready"
+        }
+
+        switch progress.phase {
+        case .preparing:
+            return "Preparing scan"
+        case .inventory:
+            return "Mapping accessible folders"
+        case .detection:
+            return progress.currentCategory.map { "Classifying \($0.title)" } ?? "Scanning project data"
+        case .aggregation:
+            return "Grouping results"
+        case .completed:
+            return "Results assembled"
+        }
+    }
+
+    var scanPhaseDetail: String {
+        guard let progress = scanProgress else {
+            if let snapshot = scanSnapshot {
+                return "\(snapshot.items.count.formatted()) findings across \(categorySummaries.count.formatted()) categories"
+            }
+            return "Pick a scope and start scanning."
+        }
+
+        let visited = progress.processedEntries.formatted()
+        let flagged = progress.matchedItems.formatted()
+
+        switch progress.phase {
+        case .preparing:
+            return "Loading scan rules and preparing the workspace."
+        case .inventory:
+            return "Inventorying visible locations across the chosen scope."
+        case .detection:
+            if let currentPath = progress.currentPath, currentPath.isEmpty == false {
+                return "\(visited) entries visited · \(flagged) findings · \(currentPath)"
+            }
+            return "\(visited) entries visited · \(flagged) findings"
+        case .aggregation:
+            return "Consolidating matched folders, categories, and totals."
+        case .completed:
+            return "Final summaries are ready."
+        }
+    }
+
+    var scanPhaseFraction: Double {
+        guard let phase = scanProgress?.phase else { return scanSnapshot == nil ? 0 : 1 }
+
+        switch phase {
+        case .preparing:
+            return 0.10
+        case .inventory:
+            return 0.28
+        case .detection:
+            return 0.66
+        case .aggregation:
+            return 0.92
+        case .completed:
+            return 1.0
+        }
+    }
+
     func refreshPermissions() {
         permissionSnapshot = permissionCenter.snapshot()
     }
@@ -263,10 +342,16 @@ final class AppViewModel: ObservableObject {
 
     private func startScan(target: ScanTarget, approach: ScanApproach) {
         let stableState = isScanning ? preScanState : captureCurrentState()
+        completionPresentationTask?.cancel()
+        completionPresentationTask = nil
+        scanCompletionPresentation = nil
         scanTask?.cancel()
         scanTask = nil
         preScanState = stableState
         pendingScanItems.removeAll(keepingCapacity: true)
+        lastScanItemsFlushAt = currentUptime
+        lastPublishedProgressAt = 0
+        lastPublishedProgressPhase = .preparing
         let sessionID = UUID()
         activeScanSessionID = sessionID
         refreshPermissions()
@@ -477,21 +562,25 @@ final class AppViewModel: ObservableObject {
             statusMessage = "Scanning \(target.title)…"
 
         case let .progress(progress):
-            flushPendingScanItems()
-            scanProgress = progress
-            statusMessage = progressDescription(progress)
+            if shouldPublish(progress: progress) {
+                flushPendingScanItems(force: false)
+                scanProgress = progress
+                statusMessage = progressDescription(progress)
+                lastPublishedProgressAt = currentUptime
+                lastPublishedProgressPhase = progress.phase
+            }
 
         case let .item(item):
             pendingScanItems.append(item)
-            if pendingScanItems.count >= scanPublishBatchSize {
-                flushPendingScanItems()
+            if pendingScanItems.count >= scanPublishBatchSize || currentUptime - lastScanItemsFlushAt >= scanPublishInterval {
+                flushPendingScanItems(force: false)
             }
 
         case let .completed(snapshot):
             activeScanSessionID = UUID()
             scanTask = nil
             preScanState = nil
-            pendingScanItems.removeAll(keepingCapacity: true)
+            flushPendingScanItems(force: true)
             scanSnapshot = snapshot
             items = snapshot.items
             isScanning = false
@@ -505,6 +594,7 @@ final class AppViewModel: ObservableObject {
             selectedSection = .review
             selectedItemIDs = Set(snapshot.items.filter { $0.recommendation == .recommended }.map(\.id))
             statusMessage = "Scan complete. \(snapshot.totalMatchedBytes.byteString) flagged across \(snapshot.items.count) items."
+            presentCompletionBanner(for: snapshot)
             appendHistoryEntry(matchedBytes: snapshot.totalMatchedBytes, cleanedBytes: 0, itemCount: snapshot.items.count)
 
         case let .failed(message):
@@ -549,6 +639,7 @@ final class AppViewModel: ObservableObject {
     private func finishCancelledScan() {
         guard isScanning || scanProgress != nil || preScanState != nil else { return }
         isScanning = false
+        completionPresentationTask?.cancel()
         pendingScanItems.removeAll(keepingCapacity: true)
         scanProgress = nil
         scanTask = nil
@@ -558,6 +649,7 @@ final class AppViewModel: ObservableObject {
 
     private func finishFailedScan(message: String) {
         isScanning = false
+        completionPresentationTask?.cancel()
         pendingScanItems.removeAll(keepingCapacity: true)
         scanProgress = nil
         scanTask = nil
@@ -566,14 +658,19 @@ final class AppViewModel: ObservableObject {
         statusMessage = "Scan failed: \(message)"
     }
 
-    private func flushPendingScanItems() {
+    private func flushPendingScanItems(force: Bool) {
         guard !pendingScanItems.isEmpty else { return }
-        items.append(contentsOf: pendingScanItems)
-        pendingScanItems.removeAll(keepingCapacity: true)
-        items.sort { lhs, rhs in
+        if !force, currentUptime - lastScanItemsFlushAt < scanPublishInterval, pendingScanItems.count < scanPublishBatchSize {
+            return
+        }
+
+        let incoming = pendingScanItems.sorted { lhs, rhs in
             if lhs.byteSize == rhs.byteSize { return lhs.path < rhs.path }
             return lhs.byteSize > rhs.byteSize
         }
+        pendingScanItems.removeAll(keepingCapacity: true)
+        items = mergeSortedItems(existing: items, incoming: incoming)
+        lastScanItemsFlushAt = currentUptime
     }
 
     private func removeItemsMatchingExcludedPath(_ path: String) {
@@ -676,5 +773,69 @@ final class AppViewModel: ObservableObject {
                 self.historyEntries = updatedEntries
             }
         }
+    }
+
+    private func shouldPublish(progress: ScanProgress) -> Bool {
+        if progress.phase != lastPublishedProgressPhase {
+            return true
+        }
+        return currentUptime - lastPublishedProgressAt >= progressPublishInterval
+    }
+
+    private func mergeSortedItems(existing: [ScanItem], incoming: [ScanItem]) -> [ScanItem] {
+        guard !existing.isEmpty else { return incoming }
+        guard !incoming.isEmpty else { return existing }
+
+        var merged: [ScanItem] = []
+        merged.reserveCapacity(existing.count + incoming.count)
+
+        var leftIndex = 0
+        var rightIndex = 0
+
+        while leftIndex < existing.count && rightIndex < incoming.count {
+            let left = existing[leftIndex]
+            let right = incoming[rightIndex]
+
+            if left.byteSize > right.byteSize || (left.byteSize == right.byteSize && left.path <= right.path) {
+                merged.append(left)
+                leftIndex += 1
+            } else {
+                merged.append(right)
+                rightIndex += 1
+            }
+        }
+
+        if leftIndex < existing.count {
+            merged.append(contentsOf: existing[leftIndex...])
+        }
+        if rightIndex < incoming.count {
+            merged.append(contentsOf: incoming[rightIndex...])
+        }
+
+        return merged
+    }
+
+    private func presentCompletionBanner(for snapshot: ScanSnapshot) {
+        let presentation = ScanCompletionPresentation(
+            approach: activeScanApproach,
+            itemCount: snapshot.items.count,
+            totalBytes: snapshot.totalMatchedBytes,
+            categoryCount: snapshot.summaries.count
+        )
+        scanCompletionPresentation = presentation
+        completionPresentationTask?.cancel()
+        completionPresentationTask = Task { [weak self, presentation] in
+            try? await Task.sleep(for: .seconds(4))
+            await MainActor.run {
+                guard self?.scanCompletionPresentation == presentation else { return }
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.86)) {
+                    self?.scanCompletionPresentation = nil
+                }
+            }
+        }
+    }
+
+    private var currentUptime: TimeInterval {
+        ProcessInfo.processInfo.systemUptime
     }
 }

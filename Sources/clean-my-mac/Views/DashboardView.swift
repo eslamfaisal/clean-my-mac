@@ -268,13 +268,42 @@ struct DashboardView: View {
 
     private var flowPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Flow")
-                .font(.headline)
-                .foregroundStyle(.secondary)
-            flowRow(index: "01", title: "Grant Access", detail: "Guide the user to Full Disk Access when needed.")
-            flowRow(index: "02", title: "Choose Scope", detail: "Pick quick scan, current user, full Mac, or a specific folder before scanning.")
-            flowRow(index: "03", title: "Review", detail: "Inspect exact paths, sizes, rationale, and risk per item.")
-            flowRow(index: "04", title: "Clean Selected", detail: "Move approved items to Trash with failure handling.")
+            if viewModel.isScanning {
+                Text("Live Scan")
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    TagPill(title: viewModel.activeScanApproach.title, tint: AppPalette.secondaryAccent)
+                    TagPill(title: viewModel.scanProgress?.phase.rawValue.capitalized ?? "Preparing", tint: AppPalette.accent)
+                }
+
+                Text(viewModel.scanPhaseTitle)
+                    .font(.title3.weight(.bold))
+
+                Text(viewModel.scanPhaseDetail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .truncationMode(.middle)
+
+                ProgressView(value: viewModel.scanPhaseFraction)
+                    .tint(AppPalette.accent)
+
+                HStack {
+                    statItem("\((viewModel.scanProgress?.processedEntries ?? 0).formatted()) visited")
+                    Spacer()
+                    statItem("\((viewModel.scanProgress?.matchedItems ?? 0).formatted()) flagged")
+                }
+            } else {
+                Text("Flow")
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
+                flowRow(index: "01", title: "Grant Access", detail: "Guide the user to Full Disk Access when needed.")
+                flowRow(index: "02", title: "Choose Scope", detail: "Pick quick scan, current user, full Mac, or a specific folder before scanning.")
+                flowRow(index: "03", title: "Review", detail: "Inspect exact paths, sizes, rationale, and risk per item.")
+                flowRow(index: "04", title: "Clean Selected", detail: "Move approved items to Trash with failure handling.")
+            }
         }
         .glassCard()
     }

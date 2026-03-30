@@ -1,16 +1,19 @@
 import Foundation
 
 enum AppFormatting {
+    private static let absoluteDateStyle = Date.FormatStyle(date: .abbreviated, time: .shortened)
+    private static let relativeDateStyle = Date.RelativeFormatStyle(presentation: .named)
+
     static func byteString(_ count: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
     }
 
     static func relativeDate(_ date: Date) -> String {
-        date.formatted(.relative(presentation: .named))
+        date.formatted(relativeDateStyle)
     }
 
     static func absoluteDate(_ date: Date) -> String {
-        date.formatted(date: .abbreviated, time: .shortened)
+        date.formatted(absoluteDateStyle)
     }
 }
 

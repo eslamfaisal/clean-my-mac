@@ -77,6 +77,9 @@ struct FileSystemScanner: ScanStreaming, Sendable {
         var itemsByPath: [String: ScanItem] = [:]
         var processedEntries = 0
         var matchedItems = 0
+        var lastProgressYieldAt = ProcessInfo.processInfo.systemUptime
+        let progressEmissionInterval: TimeInterval = 0.16
+        let progressEmissionEntryStride = 420
 
         continuation.yield(.progress(ScanProgress(
             phase: .inventory,
@@ -100,56 +103,100 @@ struct FileSystemScanner: ScanStreaming, Sendable {
 
             while let url = enumerator.nextObject() as? URL {
                 try Task.checkCancellation()
+                try autoreleasepool {
+                    let values = try? url.resourceValues(forKeys: keys)
+                    let isDirectory = values?.isDirectory ?? false
 
-                let values = try? url.resourceValues(forKeys: keys)
-                let isDirectory = values?.isDirectory ?? false
-
-                if configuration.shouldSkipTraversal(at: url, isDirectory: isDirectory, rules: rules) {
-                    if isDirectory {
-                        enumerator.skipDescendants()
-                    }
-                    continue
-                }
-
-                processedEntries += 1
-                if processedEntries % 300 == 0 {
-                    continuation.yield(.progress(ScanProgress(
-                        phase: .detection,
-                        processedEntries: processedEntries,
-                        matchedItems: matchedItems,
-                        currentPath: url.path,
-                        currentCategory: nil
-                    )))
-                }
-
-                if isDirectory {
-                    if let decision = classifier.classifyDirectory(at: url, rules: rules) {
-                        let metrics = try directoryMetrics(
-                            at: url,
-                            values: values,
-                            fileManager: fileManager,
-                            decision: decision
-                        )
-                        guard metrics.byteSize > 0 else {
+                    if configuration.shouldSkipTraversal(at: url, isDirectory: isDirectory, rules: rules) {
+                        if isDirectory {
                             enumerator.skipDescendants()
-                            continue
                         }
+                        return
+                    }
 
-                        let kind: ScanItemKind = (values?.isPackage ?? false) ? .package : .directory
+                    processedEntries += 1
+                    if processedEntries % progressEmissionEntryStride == 0,
+                       shouldEmitProgress(
+                        lastEmission: lastProgressYieldAt,
+                        minimumInterval: progressEmissionInterval
+                       ) {
+                        continuation.yield(.progress(ScanProgress(
+                            phase: .detection,
+                            processedEntries: processedEntries,
+                            matchedItems: matchedItems,
+                            currentPath: url.path,
+                            currentCategory: nil
+                        )))
+                        lastProgressYieldAt = ProcessInfo.processInfo.systemUptime
+                    }
+
+                    if isDirectory {
+                        if let decision = classifier.classifyDirectory(at: url, rules: rules) {
+                            let metrics = try directoryMetrics(
+                                at: url,
+                                values: values,
+                                fileManager: fileManager,
+                                decision: decision
+                            )
+                            guard metrics.byteSize > 0 else {
+                                enumerator.skipDescendants()
+                                return
+                            }
+
+                            let kind: ScanItemKind = (values?.isPackage ?? false) ? .package : .directory
+                            let item = ScanItem(
+                                id: url.standardizedFileURL.path,
+                                path: url.standardizedFileURL.path,
+                                kind: kind,
+                                byteSize: metrics.byteSize,
+                                lastUsedDate: values?.contentAccessDate,
+                                modifiedDate: values?.contentModificationDate,
+                                toolchain: decision.toolchain,
+                                category: decision.category,
+                                risk: decision.risk,
+                                recommendation: decision.recommendation,
+                                reason: decision.reason,
+                                sizing: metrics.sizing,
+                                capturedChildCount: metrics.childCount
+                            )
+
+                            if itemsByPath[item.path] == nil {
+                                itemsByPath[item.path] = item
+                                matchedItems += 1
+                                continuation.yield(.item(item))
+                            }
+
+                            if decision.captureDirectory {
+                                continuation.yield(.progress(ScanProgress(
+                                    phase: .detection,
+                                    processedEntries: processedEntries,
+                                    matchedItems: matchedItems,
+                                    currentPath: url.path,
+                                    currentCategory: decision.category
+                                )))
+                                lastProgressYieldAt = ProcessInfo.processInfo.systemUptime
+                                enumerator.skipDescendants()
+                            }
+                        }
+                        return
+                    }
+
+                    let size = fileByteSize(at: url, values: values, fileManager: fileManager)
+                    guard size > 0 else { return }
+
+                    if let decision = classifier.classifyFile(at: url, size: size, modifiedAt: values?.contentModificationDate ?? values?.creationDate, rules: rules) {
                         let item = ScanItem(
                             id: url.standardizedFileURL.path,
                             path: url.standardizedFileURL.path,
-                            kind: kind,
-                            byteSize: metrics.byteSize,
+                            kind: .file,
+                            byteSize: size,
                             lastUsedDate: values?.contentAccessDate,
-                            modifiedDate: values?.contentModificationDate,
+                            modifiedDate: values?.contentModificationDate ?? values?.creationDate,
                             toolchain: decision.toolchain,
                             category: decision.category,
                             risk: decision.risk,
                             recommendation: decision.recommendation,
-                            reason: decision.reason,
-                            sizing: metrics.sizing,
-                            capturedChildCount: metrics.childCount
+                            reason: decision.reason
                         )
 
                         if itemsByPath[item.path] == nil {
@@ -157,43 +204,6 @@ struct FileSystemScanner: ScanStreaming, Sendable {
                             matchedItems += 1
                             continuation.yield(.item(item))
                         }
-
-                        if decision.captureDirectory {
-                            continuation.yield(.progress(ScanProgress(
-                                phase: .detection,
-                                processedEntries: processedEntries,
-                                matchedItems: matchedItems,
-                                currentPath: url.path,
-                                currentCategory: decision.category
-                            )))
-                            enumerator.skipDescendants()
-                        }
-                    }
-                    continue
-                }
-
-                let size = fileByteSize(at: url, values: values, fileManager: fileManager)
-                guard size > 0 else { continue }
-
-                if let decision = classifier.classifyFile(at: url, size: size, modifiedAt: values?.contentModificationDate ?? values?.creationDate, rules: rules) {
-                    let item = ScanItem(
-                        id: url.standardizedFileURL.path,
-                        path: url.standardizedFileURL.path,
-                        kind: .file,
-                        byteSize: size,
-                        lastUsedDate: values?.contentAccessDate,
-                        modifiedDate: values?.contentModificationDate ?? values?.creationDate,
-                        toolchain: decision.toolchain,
-                        category: decision.category,
-                        risk: decision.risk,
-                        recommendation: decision.recommendation,
-                        reason: decision.reason
-                    )
-
-                    if itemsByPath[item.path] == nil {
-                        itemsByPath[item.path] = item
-                        matchedItems += 1
-                        continuation.yield(.item(item))
                     }
                 }
             }
@@ -363,5 +373,9 @@ struct FileSystemScanner: ScanStreaming, Sendable {
 
         let attributes = try? fileManager.attributesOfItem(atPath: url.path)
         return Int64((attributes?[.size] as? NSNumber)?.int64Value ?? 0)
+    }
+
+    private static func shouldEmitProgress(lastEmission: TimeInterval, minimumInterval: TimeInterval) -> Bool {
+        ProcessInfo.processInfo.systemUptime - lastEmission >= minimumInterval
     }
 }

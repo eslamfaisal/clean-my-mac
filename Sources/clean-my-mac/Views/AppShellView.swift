@@ -122,7 +122,31 @@ struct AppShellView: View {
                     .disabled(!viewModel.canCleanSelection)
                 }
             }
+
+            if viewModel.isScanning {
+                VStack {
+                    Spacer()
+                    ScanActivityOverlay(viewModel: viewModel)
+                        .padding(.horizontal, 24)
+                        .padding(.bottom, 22)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                .zIndex(2)
+            }
+
+            if let presentation = viewModel.scanCompletionPresentation {
+                VStack {
+                    ScanCompletionBanner(presentation: presentation)
+                        .padding(.top, 18)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    Spacer()
+                }
+                .padding(.horizontal, 24)
+                .zIndex(3)
+            }
         }
+        .animation(.spring(response: 0.48, dampingFraction: 0.84), value: viewModel.isScanning)
+        .animation(.spring(response: 0.52, dampingFraction: 0.84), value: viewModel.scanCompletionPresentation != nil)
         .sheet(isPresented: $viewModel.isCleanupSheetPresented) {
             CleanupSheetView(viewModel: viewModel)
                 .frame(minWidth: 720, minHeight: 520)
@@ -190,9 +214,7 @@ private struct ToolbarStatusView: View {
                     .frame(width: 26, height: 26)
 
                 if viewModel.isScanning {
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.8)
+                    ToolbarScannerGlyph(progress: viewModel.scanPhaseFraction)
                 } else {
                     Image(systemName: symbolName)
                         .font(.system(size: 11, weight: .bold))
@@ -223,12 +245,28 @@ private struct ToolbarStatusView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(
-            Capsule(style: .continuous)
-                .fill(AppPalette.tile)
-                .overlay(
+            ZStack {
+                Capsule(style: .continuous)
+                    .fill(AppPalette.tile)
+
+                if viewModel.isScanning {
                     Capsule(style: .continuous)
-                        .strokeBorder(AppPalette.outline, lineWidth: 1)
-                )
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    AppPalette.secondaryAccent.opacity(0.10),
+                                    AppPalette.accent.opacity(0.08),
+                                    AppPalette.secondaryAccent.opacity(0.04)
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                }
+
+                Capsule(style: .continuous)
+                    .strokeBorder(viewModel.isScanning ? AppPalette.secondaryAccent.opacity(0.18) : AppPalette.outline, lineWidth: 1)
+            }
         )
     }
 
