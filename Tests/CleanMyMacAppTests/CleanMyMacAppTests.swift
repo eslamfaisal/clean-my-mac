@@ -4,7 +4,7 @@ import XCTest
 
 final class CleanMyMacAppTests: XCTestCase {
     @MainActor
-    func testDismissSingleItemCleanupRestoresPreviousSelection() {
+    func testDismissSingleItemCleanupRestoresPreviousSelection() throws {
         let first = ScanItem(
             id: "first",
             path: "/tmp/first.log",
@@ -32,16 +32,21 @@ final class CleanMyMacAppTests: XCTestCase {
             reason: "Single-item cleanup target."
         )
 
+        let resultStore = ScanResultStore(folderName: "CleanMyMacTests-\(UUID().uuidString)")
+        try resultStore.resetForNewScan()
+        try resultStore.insertBatch([first, second])
+
         let historyStore = HistoryStore(folderName: "CleanMyMacTests-\(UUID().uuidString)")
         let viewModel = AppViewModel(
             permissionCenter: StubPermissionCenter(),
             scanner: StubScanner(),
             cleanupCoordinator: CleanupCoordinator(),
             historyStore: historyStore,
-            finderBridge: FinderBridge()
+            finderBridge: FinderBridge(),
+            resultStore: resultStore
         )
 
-        viewModel.items = [first, second]
+        viewModel.reloadCurrentPage()
         viewModel.selectedItemIDs = [first.id]
         viewModel.focusedItemIDs = [first.id]
 
@@ -84,10 +89,14 @@ final class CleanMyMacAppTests: XCTestCase {
             reason: "Late event after cancel."
         )
 
+        let resultStore = ScanResultStore(folderName: "CleanMyMacTests-\(UUID().uuidString)")
+        try resultStore.resetForNewScan()
+        try resultStore.insertBatch([existing])
+
         let stableSnapshot = ScanSnapshot(
             target: .currentUser(),
-            items: [existing],
-            summaries: [existing].summaries(),
+            itemCount: 1,
+            summaries: resultStore.categorySummaries(),
             startedAt: .now,
             endedAt: .now,
             totalMatchedBytes: existing.byteSize
@@ -99,10 +108,11 @@ final class CleanMyMacAppTests: XCTestCase {
             scanner: DelayedScanner(item: incoming),
             cleanupCoordinator: CleanupCoordinator(),
             historyStore: historyStore,
-            finderBridge: FinderBridge()
+            finderBridge: FinderBridge(),
+            resultStore: resultStore
         )
 
-        viewModel.items = [existing]
+        viewModel.reloadCurrentPage()
         viewModel.scanSnapshot = stableSnapshot
         viewModel.selectedSection = .review
         viewModel.selectedCategory = .logs
@@ -114,18 +124,56 @@ final class CleanMyMacAppTests: XCTestCase {
 
         XCTAssertFalse(viewModel.isScanning)
         XCTAssertNil(viewModel.scanProgress)
-        XCTAssertEqual(viewModel.items.map(\.id), [existing.id])
-        XCTAssertEqual(viewModel.scanSnapshot?.items.map(\.id), [existing.id])
         XCTAssertEqual(viewModel.selectedSection, .review)
         XCTAssertEqual(viewModel.selectedCategory, .logs)
         XCTAssertEqual(viewModel.statusMessage, "Scan cancelled.")
-        XCTAssertFalse(viewModel.items.contains(where: { $0.id == incoming.id }))
+    }
+
+    @MainActor
+    func testStartingNewScanResetsProgressAndSkipsLiveItemMutation() async throws {
+        let incoming = ScanItem(
+            id: "incoming",
+            path: "/tmp/incoming.log",
+            kind: .file,
+            byteSize: 512,
+            lastUsedDate: nil,
+            modifiedDate: .now,
+            toolchain: nil,
+            category: .logs,
+            risk: .low,
+            recommendation: .recommended,
+            reason: "Live event."
+        )
+
+        let resultStore = ScanResultStore(folderName: "CleanMyMacTests-\(UUID().uuidString)")
+        let historyStore = HistoryStore(folderName: "CleanMyMacTests-\(UUID().uuidString)")
+        let viewModel = AppViewModel(
+            permissionCenter: StubPermissionCenter(),
+            scanner: DelayedScanner(item: incoming),
+            cleanupCoordinator: CleanupCoordinator(),
+            historyStore: historyStore,
+            finderBridge: FinderBridge(),
+            resultStore: resultStore
+        )
+
+        viewModel.startScan()
+        try await Task.sleep(for: .milliseconds(90))
+
+        XCTAssertTrue(viewModel.isScanning)
+        XCTAssertTrue(viewModel.loadedItems.isEmpty)
+
+        viewModel.cancelScan()
+        viewModel.startScan()
+
+        XCTAssertEqual(viewModel.scanProgress?.processedEntries, 0)
+        XCTAssertEqual(viewModel.scanProgress?.matchedItems, 0)
+        XCTAssertTrue(viewModel.isScanning)
     }
 
     @MainActor
     func testViewModelRetainsFailedCleanupItems() async throws {
         let succeeded = ScanItem(
-            id: "ok",
+            id: "/tmp/ok.cache",
             path: "/tmp/ok.cache",
             kind: .file,
             byteSize: 100,
@@ -138,7 +186,7 @@ final class CleanMyMacAppTests: XCTestCase {
             reason: "Safe cache."
         )
         let failed = ScanItem(
-            id: "fail",
+            id: "/tmp/fail.cache",
             path: "/tmp/fail.cache",
             kind: .file,
             byteSize: 200,
@@ -150,6 +198,10 @@ final class CleanMyMacAppTests: XCTestCase {
             recommendation: .review,
             reason: "Could not be trashed."
         )
+
+        let resultStore = ScanResultStore(folderName: "CleanMyMacTests-\(UUID().uuidString)")
+        try resultStore.resetForNewScan()
+        try resultStore.insertBatch([succeeded, failed])
 
         let cleanupCoordinator = MockCleanupCoordinator(result: CleanupResult(
             succeededPaths: [succeeded.path],
@@ -164,14 +216,15 @@ final class CleanMyMacAppTests: XCTestCase {
             scanner: StubScanner(),
             cleanupCoordinator: cleanupCoordinator,
             historyStore: historyStore,
-            finderBridge: FinderBridge()
+            finderBridge: FinderBridge(),
+            resultStore: resultStore
         )
 
-        viewModel.items = [succeeded, failed]
+        viewModel.reloadCurrentPage()
         viewModel.scanSnapshot = ScanSnapshot(
             target: .internalVolume,
-            items: [succeeded, failed],
-            summaries: [succeeded, failed].summaries(),
+            itemCount: 2,
+            summaries: resultStore.categorySummaries(),
             startedAt: .now,
             endedAt: .now,
             totalMatchedBytes: succeeded.byteSize + failed.byteSize
@@ -186,9 +239,12 @@ final class CleanMyMacAppTests: XCTestCase {
         )
 
         viewModel.executeCleanup()
-        try await Task.sleep(for: .milliseconds(100))
+        try await Task.sleep(for: .milliseconds(200))
 
-        XCTAssertEqual(viewModel.items.map(\.id), [failed.id])
+        // After cleanup, only the failed item should remain in the store
+        let remainingItems = resultStore.fetchPage(category: nil, searchText: nil, offset: 0, limit: 100)
+        XCTAssertEqual(remainingItems.count, 1)
+        XCTAssertEqual(remainingItems.first?.id, failed.id)
         XCTAssertEqual(viewModel.selectedItemIDs, [failed.id])
         XCTAssertEqual(viewModel.lastCleanupResult?.failedItems.first?.path, failed.path)
     }
@@ -201,23 +257,41 @@ final class CleanMyMacAppTests: XCTestCase {
         try fixture.createDirectory(nodeModules)
         try fixture.createFile(at: nodeModules.appending(path: "left-pad/index.js"), size: 512)
 
-        let scanner = FileSystemScanner(configuration: ScannerConfiguration(
-            largeFileThresholdBytes: 10_000_000,
-            oldFileCutoff: .distantPast,
-            protectedSystemPrefixes: []
-        ))
+        let scanner = FileSystemScanner(configuration: ScannerConfiguration.default())
+        let result = try await collectScanResult(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
 
-        let snapshot = try await collectSnapshot(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
+        XCTAssertEqual(result.items.count, 1)
+        XCTAssertEqual(result.items.first?.category, .devCaches)
+        XCTAssertEqual(result.items.first?.toolchain, "Node.js")
+        XCTAssertEqual(result.items.first?.recommendation, .recommended)
+        XCTAssertEqual(result.items.first?.sizing, .estimatedFastFolder)
+        XCTAssertNotNil(result.items.first?.capturedChildCount)
+        XCTAssertGreaterThan(result.items.first?.byteSize ?? 0, 0)
+        XCTAssertTrue(result.items.first?.path.hasSuffix("/node_modules") == true)
+        XCTAssertFalse(result.items.contains(where: { $0.path.contains("left-pad/index.js") }))
+    }
 
-        XCTAssertEqual(snapshot.items.count, 1)
-        XCTAssertEqual(snapshot.items.first?.category, .devCaches)
-        XCTAssertEqual(snapshot.items.first?.toolchain, "Node.js")
-        XCTAssertEqual(snapshot.items.first?.recommendation, .recommended)
-        XCTAssertEqual(snapshot.items.first?.sizing, .estimatedFastFolder)
-        XCTAssertNotNil(snapshot.items.first?.capturedChildCount)
-        XCTAssertGreaterThan(snapshot.items.first?.byteSize ?? 0, 0)
-        XCTAssertTrue(snapshot.items.first?.path.hasSuffix("/node_modules") == true)
-        XCTAssertFalse(snapshot.items.contains(where: { $0.path.contains("left-pad/index.js") }))
+    func testScannerCapturesHiddenDotFoldersWithoutScanningDescendants() async throws {
+        let fixture = try TestFixture()
+        defer { fixture.cleanup() }
+
+        let gitFolder = fixture.rootURL.appending(path: "Workspace/.git", directoryHint: .isDirectory)
+        let genericHiddenFolder = fixture.rootURL.appending(path: "Workspace/.cache-local", directoryHint: .isDirectory)
+        try fixture.createDirectory(gitFolder)
+        try fixture.createDirectory(genericHiddenFolder)
+        try fixture.createFile(at: gitFolder.appending(path: "objects/ab/object"), size: 1024)
+        try fixture.createFile(at: genericHiddenFolder.appending(path: "nested/blob.bin"), size: 2048)
+
+        let scanner = FileSystemScanner(configuration: ScannerConfiguration.default())
+        let result = try await collectScanResult(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
+        let itemsByPath = Dictionary(uniqueKeysWithValues: result.items.map { ($0.path, $0) })
+
+        XCTAssertEqual(itemsByPath[gitFolder.path]?.category, .other)
+        XCTAssertEqual(itemsByPath[gitFolder.path]?.recommendation, .manualInspection)
+        XCTAssertEqual(itemsByPath[gitFolder.path]?.sizing, .estimatedFastFolder)
+        XCTAssertEqual(itemsByPath[genericHiddenFolder.path]?.sizing, .estimatedFastFolder)
+        XCTAssertFalse(result.items.contains(where: { $0.path.contains("/.git/objects/") }))
+        XCTAssertFalse(result.items.contains(where: { $0.path.contains("/.cache-local/nested/") }))
     }
 
     func testScannerHonorsExcludedPaths() async throws {
@@ -230,18 +304,14 @@ final class CleanMyMacAppTests: XCTestCase {
         try fixture.createFile(at: excluded.appending(path: "project/build.db"), size: 2_048)
         try fixture.createFile(at: included, size: 512)
 
-        let scanner = FileSystemScanner(configuration: ScannerConfiguration(
-            largeFileThresholdBytes: 10_000_000,
-            oldFileCutoff: .distantPast,
-            protectedSystemPrefixes: []
-        ))
+        let scanner = FileSystemScanner(configuration: ScannerConfiguration.default())
         let rules = [UserRule(kind: .excludedPath, value: excluded.path)]
 
-        let snapshot = try await collectSnapshot(from: scanner.scan(target: .custom([fixture.rootURL]), rules: rules))
+        let result = try await collectScanResult(from: scanner.scan(target: .custom([fixture.rootURL]), rules: rules))
 
-        XCTAssertEqual(snapshot.items.count, 1)
-        XCTAssertEqual(snapshot.items.first?.category, .logs)
-        XCTAssertTrue(snapshot.items.first?.path.hasSuffix("/Logs") == true)
+        XCTAssertEqual(result.items.count, 1)
+        XCTAssertEqual(result.items.first?.category, .logs)
+        XCTAssertTrue(result.items.first?.path.hasSuffix("/Logs") == true)
     }
 
     func testScannerDoesNotFlagDeveloperManifestsAsInstallers() async throws {
@@ -252,15 +322,10 @@ final class CleanMyMacAppTests: XCTestCase {
         try fixture.createFile(at: fixture.rootURL.appending(path: "setup.py"), size: 256)
         try fixture.createFile(at: fixture.rootURL.appending(path: "android/build.gradle"), size: 256)
 
-        let scanner = FileSystemScanner(configuration: ScannerConfiguration(
-            largeFileThresholdBytes: 10_000_000,
-            oldFileCutoff: .distantPast,
-            protectedSystemPrefixes: []
-        ))
+        let scanner = FileSystemScanner(configuration: ScannerConfiguration.default())
+        let result = try await collectScanResult(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
 
-        let snapshot = try await collectSnapshot(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
-
-        XCTAssertTrue(snapshot.items.isEmpty)
+        XCTAssertTrue(result.items.isEmpty)
     }
 
     func testCleanupPlanAccumulatesWarningsAndBytes() {
@@ -322,24 +387,19 @@ final class CleanMyMacAppTests: XCTestCase {
         try fixture.createFile(at: dmgFile, size: 2048)
         try fixture.createFile(at: apkFile, size: 2048)
 
-        let scanner = FileSystemScanner(configuration: ScannerConfiguration(
-            largeFileThresholdBytes: 10_000_000,
-            oldFileCutoff: .distantPast,
-            protectedSystemPrefixes: []
-        ))
-
-        let snapshot = try await collectSnapshot(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
-        let categoriesByPath = Dictionary(uniqueKeysWithValues: snapshot.items.map { ($0.path, $0.category) })
+        let scanner = FileSystemScanner(configuration: ScannerConfiguration.default())
+        let result = try await collectScanResult(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
+        let categoriesByPath = Dictionary(uniqueKeysWithValues: result.items.map { ($0.path, $0.category) })
 
         XCTAssertEqual(categoriesByPath[buildFolder.path], .buildArtifacts)
         XCTAssertEqual(categoriesByPath[flutterToolState.path], .devCaches)
         XCTAssertEqual(categoriesByPath[javaTarget.path], .buildArtifacts)
         XCTAssertEqual(categoriesByPath[dmgFile.path], .applicationBuilds)
         XCTAssertEqual(categoriesByPath[apkFile.path], .applicationBuilds)
-        XCTAssertEqual(snapshot.items.first(where: { $0.path == buildFolder.path })?.sizing, .estimatedFastFolder)
-        XCTAssertEqual(snapshot.items.first(where: { $0.path == flutterToolState.path })?.sizing, .estimatedFastFolder)
-        XCTAssertEqual(snapshot.items.first(where: { $0.path == javaTarget.path })?.sizing, .estimatedFastFolder)
-        XCTAssertEqual(snapshot.items.first(where: { $0.path == buildFolder.path })?.recommendation, .recommended)
+        XCTAssertEqual(result.items.first(where: { $0.path == buildFolder.path })?.sizing, .estimatedFastFolder)
+        XCTAssertEqual(result.items.first(where: { $0.path == flutterToolState.path })?.sizing, .estimatedFastFolder)
+        XCTAssertEqual(result.items.first(where: { $0.path == javaTarget.path })?.sizing, .estimatedFastFolder)
+        XCTAssertEqual(result.items.first(where: { $0.path == buildFolder.path })?.recommendation, .recommended)
         XCTAssertFalse(categoriesByPath.keys.contains(buildFolder.appending(path: "outputs/main.o").path))
         XCTAssertFalse(categoriesByPath.keys.contains(flutterToolState.appending(path: "cache/snapshot.bin").path))
         XCTAssertFalse(categoriesByPath.keys.contains(javaTarget.appending(path: "classes/App.class").path))
@@ -363,14 +423,9 @@ final class CleanMyMacAppTests: XCTestCase {
         try fixture.createDirectory(bazelOut)
         try fixture.createFile(at: bazelOut.appending(path: "k8-fastbuild/bin/app"), size: 1024)
 
-        let scanner = FileSystemScanner(configuration: ScannerConfiguration(
-            largeFileThresholdBytes: 10_000_000,
-            oldFileCutoff: .distantPast,
-            protectedSystemPrefixes: []
-        ))
-
-        let snapshot = try await collectSnapshot(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
-        let categoriesByPath = Dictionary(uniqueKeysWithValues: snapshot.items.map { ($0.path, $0.category) })
+        let scanner = FileSystemScanner(configuration: ScannerConfiguration.default())
+        let result = try await collectScanResult(from: scanner.scan(target: .custom([fixture.rootURL]), rules: []))
+        let categoriesByPath = Dictionary(uniqueKeysWithValues: result.items.map { ($0.path, $0.category) })
 
         XCTAssertEqual(categoriesByPath[pythonVenv.path], .devCaches)
         XCTAssertEqual(categoriesByPath[nextBuild.path], .buildArtifacts)
@@ -378,15 +433,35 @@ final class CleanMyMacAppTests: XCTestCase {
         XCTAssertEqual(categoriesByPath[bazelOut.path], .buildArtifacts)
     }
 
-    private func collectSnapshot(from stream: AsyncThrowingStream<ScanEvent, Error>) async throws -> ScanSnapshot {
+    /// Collects all items from the scan stream (items come individually, not in snapshot).
+    private func collectScanResult(from stream: AsyncThrowingStream<ScanEvent, Error>) async throws -> ScanResult {
+        var items: [ScanItem] = []
+        var snapshot: ScanSnapshot?
+
         for try await event in stream {
-            if case let .completed(snapshot) = event {
-                return snapshot
+            switch event {
+            case .item(let item):
+                items.append(item)
+            case .completed(let s):
+                snapshot = s
+            default:
+                break
             }
         }
-        XCTFail("Scan stream completed without a snapshot.")
-        throw SnapshotCollectionError.missingCompletedEvent
+
+        guard let snapshot else {
+            XCTFail("Scan stream completed without a snapshot.")
+            throw SnapshotCollectionError.missingCompletedEvent
+        }
+
+        return ScanResult(items: items, snapshot: snapshot)
     }
+}
+
+/// Holds scan items collected from the stream alongside the completion snapshot.
+private struct ScanResult {
+    let items: [ScanItem]
+    let snapshot: ScanSnapshot
 }
 
 private enum SnapshotCollectionError: Error {
@@ -455,8 +530,8 @@ private struct DelayedScanner: ScanStreaming {
                 try? await Task.sleep(for: .milliseconds(80))
                 continuation.yield(.completed(ScanSnapshot(
                     target: target,
-                    items: [item],
-                    summaries: [item].summaries(),
+                    itemCount: 1,
+                    summaries: [],
                     startedAt: .now,
                     endedAt: .now,
                     totalMatchedBytes: item.byteSize

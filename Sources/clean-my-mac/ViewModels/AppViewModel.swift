@@ -55,17 +55,17 @@ final class AppViewModel: ObservableObject {
     private struct PreScanState {
         let selectedSection: AppSection
         let selectedCategory: ScanCategory?
-        let items: [ScanItem]
         let scanSnapshot: ScanSnapshot?
         let selectedItemIDs: Set<String>
         let focusedItemIDs: Set<String>
         let lastCleanupResult: CleanupResult?
     }
 
+    // MARK: - Published Properties
+
     @Published var selectedSection: AppSection = .dashboard
     @Published var permissionSnapshot: PermissionSnapshot
     @Published var scanSnapshot: ScanSnapshot?
-    @Published var items: [ScanItem] = []
     @Published var scanProgress: ScanProgress?
     @Published var isScanning = false
     @Published var searchText = ""
@@ -84,37 +84,62 @@ final class AppViewModel: ObservableObject {
     @Published var scanCompletionPresentation: ScanCompletionPresentation?
     @Published var statusMessage = "Ready to inspect your Mac."
 
+    /// Paginated items loaded from SQLite for display. NOT the full result set.
+    @Published var loadedItems: [ScanItem] = []
+    /// Total number of items in the database matching current filters.
+    @Published var totalItemCount: Int = 0
+    /// Whether more items can be loaded from the database.
+    @Published var hasMoreItems: Bool = false
+    /// Category summaries computed from SQLite GROUP BY query.
+    @Published var categorySummariesCache: [CategorySummary] = []
+
+    // MARK: - Private State
+
     private let permissionCenter: PermissionProviding
     private let scanner: ScanStreaming
     private let cleanupCoordinator: any CleanupCoordinating
     private let historyStore: HistoryStore
     private let finderBridge: FinderBridge
+    private let resultStore: ScanResultStoring
     private var scanTask: Task<Void, Never>?
     private var activeScanSessionID = UUID()
     private var preScanState: PreScanState?
     private var cleanupSheetSource: CleanupSheetSource?
-    private var pendingScanItems: [ScanItem] = []
-    private let scanPublishBatchSize = 160
-    private let scanPublishInterval: TimeInterval = 0.18
+    private var completionPresentationTask: Task<Void, Never>?
+
+    // Batch insert buffer: items accumulate here before being flushed to SQLite.
+    private var pendingInsertBatch: [ScanItem] = []
+    private let insertBatchSize = 200
+    private let insertFlushInterval: TimeInterval = 0.25
+    private var lastInsertFlushAt: TimeInterval = 0
+
+    // Pagination state
+    private var currentPageOffset: Int = 0
+    private let pageSize = 50
+
+    // Progress throttling
     private let progressPublishInterval: TimeInterval = 0.12
-    private var lastScanItemsFlushAt: TimeInterval = 0
     private var lastPublishedProgressAt: TimeInterval = 0
     private var lastPublishedProgressPhase: ScanPhase?
-    private var completionPresentationTask: Task<Void, Never>?
 
     init(
         permissionCenter: PermissionProviding = PermissionCenter(),
-        scanner: ScanStreaming = FileSystemScanner(),
+        scanner: ScanStreaming? = nil,
         cleanupCoordinator: any CleanupCoordinating = CleanupCoordinator(),
         historyStore: HistoryStore = HistoryStore(),
-        finderBridge: FinderBridge = FinderBridge()
+        finderBridge: FinderBridge = FinderBridge(),
+        resultStore: ScanResultStoring = ScanResultStore()
     ) {
         self.permissionCenter = permissionCenter
-        self.scanner = scanner
         self.cleanupCoordinator = cleanupCoordinator
         self.historyStore = historyStore
         self.finderBridge = finderBridge
+        self.resultStore = resultStore
         self.permissionSnapshot = permissionCenter.snapshot()
+
+        // Build scanner with the database path excluded from scanning
+        let configuration = ScannerConfiguration.default(databasePath: resultStore.databasePath)
+        self.scanner = scanner ?? FileSystemScanner(configuration: configuration)
 
         Task { [weak self] in
             await self?.loadPersistedState()
@@ -125,44 +150,45 @@ final class AppViewModel: ObservableObject {
         scanTask?.cancel()
     }
 
+    // MARK: - Computed Properties (database-backed)
+
+    /// Items currently loaded for display. The main list shows these.
     var visibleItems: [ScanItem] {
-        items.filter { item in
-            let categoryMatch = selectedCategory.map { item.category == $0 } ?? true
-            let queryMatch = searchText.isEmpty || item.name.localizedCaseInsensitiveContains(searchText) || item.path.localizedCaseInsensitiveContains(searchText)
-            return categoryMatch && queryMatch
-        }
+        loadedItems
     }
 
     var selectedInspectorItem: ScanItem? {
         if let focusedID = focusedItemIDs.first {
-            return items.first(where: { $0.id == focusedID })
+            return loadedItems.first(where: { $0.id == focusedID })
+                ?? resultStore.fetchItems(ids: [focusedID]).first
         }
         if let selectedID = selectedItemIDs.first {
-            return items.first(where: { $0.id == selectedID })
+            return loadedItems.first(where: { $0.id == selectedID })
+                ?? resultStore.fetchItems(ids: [selectedID]).first
         }
         return nil
     }
 
     var categorySummaries: [CategorySummary] {
-        scanSnapshot?.summaries ?? items.summaries()
+        categorySummariesCache
     }
 
     var topOffenders: [ScanItem] {
-        Array(items.prefix(8))
+        resultStore.topOffenders(limit: 8)
     }
 
     var selectedReclaimableBytes: Int64 {
-        items.filter { selectedItemIDs.contains($0.id) }.reduce(into: Int64.zero) { $0 += $1.byteSize }
+        resultStore.selectedReclaimableBytes(ids: selectedItemIDs)
     }
 
     var allVisibleItemsSelected: Bool {
-        let visibleIDs = Set(visibleItems.map(\.id))
+        let visibleIDs = Set(loadedItems.map(\.id))
         guard !visibleIDs.isEmpty else { return false }
         return visibleIDs.isSubset(of: selectedItemIDs)
     }
 
     var recommendedItemCount: Int {
-        items.filter { $0.recommendation == .recommended }.count
+        resultStore.recommendedItemCount()
     }
 
     var canCleanSelection: Bool {
@@ -192,7 +218,7 @@ final class AppViewModel: ObservableObject {
             return "\(result.reclaimedBytes.byteString) moved to Trash"
         }
         if let snapshot = scanSnapshot {
-            return "\(snapshot.items.count.formatted()) items · \(snapshot.totalMatchedBytes.byteString)"
+            return "\(snapshot.itemCount.formatted()) items · \(snapshot.totalMatchedBytes.byteString)"
         }
         return permissionSnapshot.requiresAttention ? "Grant Full Disk Access to scan protected folders" : "Run a full-disk cleanup scan"
     }
@@ -219,7 +245,7 @@ final class AppViewModel: ObservableObject {
     var scanPhaseDetail: String {
         guard let progress = scanProgress else {
             if let snapshot = scanSnapshot {
-                return "\(snapshot.items.count.formatted()) findings across \(categorySummaries.count.formatted()) categories"
+                return "\(snapshot.itemCount.formatted()) findings across \(categorySummaries.count.formatted()) categories"
             }
             return "Pick a scope and start scanning."
         }
@@ -261,6 +287,8 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Permissions
+
     func refreshPermissions() {
         permissionSnapshot = permissionCenter.snapshot()
     }
@@ -268,6 +296,8 @@ final class AppViewModel: ObservableObject {
     func openSystemSettings(for requirement: PermissionRequirement) {
         permissionCenter.openSystemSettings(for: requirement)
     }
+
+    // MARK: - Scan Setup
 
     var canStartSelectedScan: Bool {
         selectedScanApproach != .specificPath || !customScanPath.isEmpty
@@ -316,6 +346,8 @@ final class AppViewModel: ObservableObject {
         startScan(target: target, approach: selectedScanApproach)
     }
 
+    // MARK: - Scan Execution
+
     func startScan() {
         startScan(target: .internalVolume, approach: .fullMac)
     }
@@ -348,10 +380,16 @@ final class AppViewModel: ObservableObject {
         scanTask?.cancel()
         scanTask = nil
         preScanState = stableState
-        pendingScanItems.removeAll(keepingCapacity: true)
-        lastScanItemsFlushAt = currentUptime
+
+        // Reset SQLite database for new scan
+        try? resultStore.resetForNewScan()
+
+        // Reset batch insert state
+        pendingInsertBatch.removeAll(keepingCapacity: true)
+        lastInsertFlushAt = currentUptime
         lastPublishedProgressAt = 0
         lastPublishedProgressPhase = .preparing
+
         let sessionID = UUID()
         activeScanSessionID = sessionID
         refreshPermissions()
@@ -371,7 +409,14 @@ final class AppViewModel: ObservableObject {
             currentPath: nil,
             currentCategory: nil
         )
-        items.removeAll()
+
+        // Clear paginated display
+        loadedItems.removeAll()
+        totalItemCount = 0
+        hasMoreItems = false
+        categorySummariesCache = []
+        currentPageOffset = 0
+
         scanSnapshot = nil
         lastCleanupResult = nil
 
@@ -402,9 +447,12 @@ final class AppViewModel: ObservableObject {
         finishCancelledScan()
     }
 
+    // MARK: - Selection & Navigation
+
     func selectCategory(_ category: ScanCategory?) {
         selectedCategory = category
         selectedSection = .review
+        reloadCurrentPage()
     }
 
     func setSelection(_ isSelected: Bool, for itemID: String) {
@@ -420,7 +468,14 @@ final class AppViewModel: ObservableObject {
     }
 
     func selectRecommendedItems() {
-        selectedItemIDs = Set(items.filter { $0.recommendation == .recommended }.map(\.id))
+        // Fetch all recommended item IDs from SQLite
+        let recommendedItems = resultStore.fetchPage(
+            category: nil,
+            searchText: nil,
+            offset: 0,
+            limit: FileSystemScanner.maxMatchedItems
+        ).filter { $0.recommendation == .recommended }
+        selectedItemIDs = Set(recommendedItems.map(\.id))
         statusMessage = "Selected \(selectedItemIDs.count) recommended items."
     }
 
@@ -429,7 +484,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func setVisibleItemsSelected(_ isSelected: Bool) {
-        let visibleIDs = Set(visibleItems.map(\.id))
+        let visibleIDs = Set(loadedItems.map(\.id))
         guard !visibleIDs.isEmpty else { return }
 
         if isSelected {
@@ -441,8 +496,43 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Pagination
+
+    func loadMoreItems() {
+        guard hasMoreItems, !isScanning else { return }
+        currentPageOffset += pageSize
+        let nextPage = resultStore.fetchPage(
+            category: selectedCategory,
+            searchText: searchText.isEmpty ? nil : searchText,
+            offset: currentPageOffset,
+            limit: pageSize
+        )
+        loadedItems.append(contentsOf: nextPage)
+        hasMoreItems = nextPage.count == pageSize
+    }
+
+    /// Called when search text or category filter changes.
+    func reloadCurrentPage() {
+        currentPageOffset = 0
+        let searchQuery = searchText.isEmpty ? nil : searchText
+        loadedItems = resultStore.fetchPage(
+            category: selectedCategory,
+            searchText: searchQuery,
+            offset: 0,
+            limit: pageSize
+        )
+        totalItemCount = resultStore.totalCount(
+            category: selectedCategory,
+            searchText: searchQuery
+        )
+        hasMoreItems = loadedItems.count == pageSize
+    }
+
+    // MARK: - Cleanup
+
     func presentCleanupSheet() {
-        let plan = cleanupCoordinator.makePlan(items: items, selectedIDs: selectedItemIDs, rules: rules)
+        let selectedItems = resultStore.fetchItems(ids: selectedItemIDs)
+        let plan = cleanupCoordinator.makePlan(items: selectedItems, selectedIDs: selectedItemIDs, rules: rules)
         guard !plan.items.isEmpty else { return }
         cleanupPlan = plan
         cleanupSheetSource = .bulk
@@ -453,7 +543,7 @@ final class AppViewModel: ObservableObject {
         let selectionSnapshot = selectedItemIDs
         let focusSnapshot = focusedItemIDs
         selectedItemIDs.insert(item.id)
-        let plan = cleanupCoordinator.makePlan(items: items, selectedIDs: [item.id], rules: rules)
+        let plan = cleanupCoordinator.makePlan(items: [item], selectedIDs: [item.id], rules: rules)
         guard !plan.items.isEmpty else {
             selectedItemIDs = selectionSnapshot
             focusedItemIDs = focusSnapshot
@@ -469,16 +559,20 @@ final class AppViewModel: ObservableObject {
         isCleanupSheetPresented = false
 
         let coordinator = cleanupCoordinator
+        let store = resultStore
         Task.detached {
             let result = coordinator.execute(plan: plan)
+            let succeededPaths = Set(
+                plan.items
+                    .filter { result.succeededPaths.contains($0.path) }
+                    .map(\.path)
+            )
+            // Delete cleaned items from SQLite
+            try? store.deleteItems(paths: succeededPaths)
+
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                let succeededIDs = Set(
-                    plan.items
-                        .filter { result.succeededPaths.contains($0.path) }
-                        .map(\.id)
-                )
-                self.applyCleanupResult(result, removedIDs: succeededIDs)
+                self.applyCleanupResult(result, removedIDs: succeededPaths)
             }
         }
     }
@@ -493,11 +587,14 @@ final class AppViewModel: ObservableObject {
         cleanupPlan = nil
     }
 
+    // MARK: - Item Actions
+
     func inspect(_ item: ScanItem) {
         selectedSection = .review
         selectedCategory = nil
         searchText = ""
         focusedItemIDs = [item.id]
+        reloadCurrentPage()
     }
 
     func reveal(_ item: ScanItem) {
@@ -522,9 +619,12 @@ final class AppViewModel: ObservableObject {
     func excludeItemFolder(_ item: ScanItem) {
         let excludedPath = item.isDirectory ? item.path : item.folderPath
         addExcludedPath(excludedPath)
-        removeItemsMatchingExcludedPath(excludedPath)
+        try? resultStore.deleteItemsMatching(excludedPath: excludedPath)
+        refreshAfterDataChange()
         statusMessage = "Excluded \(excludedPath) from future scans."
     }
+
+    // MARK: - Rules
 
     func addExcludedPath(_ path: String) {
         let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
@@ -557,6 +657,8 @@ final class AppViewModel: ObservableObject {
         persistState()
     }
 
+    // MARK: - Event Handling
+
     private func handle(_ event: ScanEvent) {
         switch event {
         case let .started(target):
@@ -564,7 +666,6 @@ final class AppViewModel: ObservableObject {
 
         case let .progress(progress):
             if shouldPublish(progress: progress) {
-                flushPendingScanItems(force: false)
                 scanProgress = progress
                 statusMessage = progressDescription(progress)
                 lastPublishedProgressAt = currentUptime
@@ -572,33 +673,61 @@ final class AppViewModel: ObservableObject {
             }
 
         case let .item(item):
-            pendingScanItems.append(item)
-            if pendingScanItems.count >= scanPublishBatchSize || currentUptime - lastScanItemsFlushAt >= scanPublishInterval {
-                flushPendingScanItems(force: false)
+            // Buffer items for batch SQLite insertion
+            pendingInsertBatch.append(item)
+            if pendingInsertBatch.count >= insertBatchSize ||
+               currentUptime - lastInsertFlushAt >= insertFlushInterval {
+                flushPendingInserts()
             }
 
         case let .completed(snapshot):
+            // Flush any remaining buffered items
+            flushPendingInserts()
+
             activeScanSessionID = UUID()
             scanTask = nil
             preScanState = nil
-            flushPendingScanItems(force: true)
-            scanSnapshot = snapshot
-            items = snapshot.items
+
+            // Build the final snapshot with summaries from SQLite
+            let summaries = resultStore.categorySummaries()
+            let finalItemCount = resultStore.itemCount()
+            let finalTotalBytes = resultStore.totalMatchedBytes()
+            let finalSnapshot = ScanSnapshot(
+                target: snapshot.target,
+                itemCount: finalItemCount,
+                summaries: summaries,
+                startedAt: snapshot.startedAt,
+                endedAt: snapshot.endedAt,
+                totalMatchedBytes: finalTotalBytes
+            )
+
+            scanSnapshot = finalSnapshot
+            categorySummariesCache = summaries
             isScanning = false
             scanProgress = ScanProgress(
                 phase: .completed,
-                processedEntries: scanProgress?.processedEntries ?? snapshot.items.count,
-                matchedItems: snapshot.items.count,
+                processedEntries: scanProgress?.processedEntries ?? finalItemCount,
+                matchedItems: finalItemCount,
                 currentPath: nil,
                 currentCategory: nil
             )
             selectedSection = .review
-            selectedItemIDs = Set(snapshot.items.filter { $0.recommendation == .recommended }.map(\.id))
-            statusMessage = "Scan complete. \(snapshot.totalMatchedBytes.byteString) flagged across \(snapshot.items.count) items."
-            presentCompletionBanner(for: snapshot)
-            appendHistoryEntry(matchedBytes: snapshot.totalMatchedBytes, cleanedBytes: 0, itemCount: snapshot.items.count)
+
+            // Load first page of results sorted by size
+            reloadCurrentPage()
+
+            // Auto-select recommended items (from SQLite, not in-memory)
+            let recommendedItems = resultStore.fetchPage(
+                category: nil, searchText: nil, offset: 0, limit: FileSystemScanner.maxMatchedItems
+            ).filter { $0.recommendation == .recommended }
+            selectedItemIDs = Set(recommendedItems.map(\.id))
+
+            statusMessage = "Scan complete. \(finalTotalBytes.byteString) flagged across \(finalItemCount) items."
+            presentCompletionBanner(for: finalSnapshot)
+            appendHistoryEntry(matchedBytes: finalTotalBytes, cleanedBytes: 0, itemCount: finalItemCount)
 
         case let .failed(message):
+            flushPendingInserts()
             finishFailedScan(message: message)
 
         case .cancelled:
@@ -606,11 +735,27 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Batch Insert to SQLite
+
+    private func flushPendingInserts() {
+        guard !pendingInsertBatch.isEmpty else { return }
+        let batch = pendingInsertBatch
+        pendingInsertBatch.removeAll(keepingCapacity: true)
+        lastInsertFlushAt = currentUptime
+
+        // Insert on background to avoid blocking main thread
+        let store = resultStore
+        Task.detached(priority: .utility) {
+            try? store.insertBatch(batch)
+        }
+    }
+
+    // MARK: - State Management
+
     private func captureCurrentState() -> PreScanState {
         PreScanState(
             selectedSection: selectedSection,
             selectedCategory: selectedCategory,
-            items: items,
             scanSnapshot: scanSnapshot,
             selectedItemIDs: selectedItemIDs,
             focusedItemIDs: focusedItemIDs,
@@ -622,13 +767,16 @@ final class AppViewModel: ObservableObject {
         if let preScanState {
             selectedSection = preScanState.selectedSection
             selectedCategory = preScanState.selectedCategory
-            items = preScanState.items
             scanSnapshot = preScanState.scanSnapshot
             selectedItemIDs = preScanState.selectedItemIDs
             focusedItemIDs = preScanState.focusedItemIDs
             lastCleanupResult = preScanState.lastCleanupResult
+            reloadCurrentPage()
         } else {
-            items = []
+            loadedItems = []
+            totalItemCount = 0
+            hasMoreItems = false
+            categorySummariesCache = []
             scanSnapshot = nil
             selectedItemIDs.removeAll()
             focusedItemIDs.removeAll()
@@ -641,9 +789,12 @@ final class AppViewModel: ObservableObject {
         guard isScanning || scanProgress != nil || preScanState != nil else { return }
         isScanning = false
         completionPresentationTask?.cancel()
-        pendingScanItems.removeAll(keepingCapacity: true)
+        pendingInsertBatch.removeAll(keepingCapacity: true)
         scanProgress = nil
         scanTask = nil
+        lastPublishedProgressAt = 0
+        lastPublishedProgressPhase = nil
+        scanCompletionPresentation = nil
         restorePreScanState()
         statusMessage = "Scan cancelled."
     }
@@ -651,54 +802,15 @@ final class AppViewModel: ObservableObject {
     private func finishFailedScan(message: String) {
         isScanning = false
         completionPresentationTask?.cancel()
-        pendingScanItems.removeAll(keepingCapacity: true)
+        pendingInsertBatch.removeAll(keepingCapacity: true)
         scanProgress = nil
         scanTask = nil
         activeScanSessionID = UUID()
+        lastPublishedProgressAt = 0
+        lastPublishedProgressPhase = nil
+        scanCompletionPresentation = nil
         restorePreScanState()
         statusMessage = "Scan failed: \(message)"
-    }
-
-    private func flushPendingScanItems(force: Bool) {
-        guard !pendingScanItems.isEmpty else { return }
-        if !force, currentUptime - lastScanItemsFlushAt < scanPublishInterval, pendingScanItems.count < scanPublishBatchSize {
-            return
-        }
-
-        let incoming = pendingScanItems.sorted { lhs, rhs in
-            if lhs.byteSize == rhs.byteSize { return lhs.path < rhs.path }
-            return lhs.byteSize > rhs.byteSize
-        }
-        pendingScanItems.removeAll(keepingCapacity: true)
-        items = mergeSortedItems(existing: items, incoming: incoming)
-        lastScanItemsFlushAt = currentUptime
-    }
-
-    private func removeItemsMatchingExcludedPath(_ path: String) {
-        let normalizedPath = URL(fileURLWithPath: path).standardizedFileURL.path
-        let filteredItems = items.filter { item in
-            let itemPath = URL(fileURLWithPath: item.path).standardizedFileURL.path
-            return itemPath != normalizedPath && itemPath.hasPrefix("\(normalizedPath)/") == false
-        }
-
-        items = filteredItems
-        selectedItemIDs = selectedItemIDs.filter { id in filteredItems.contains(where: { $0.id == id }) }
-        focusedItemIDs = focusedItemIDs.filter { id in filteredItems.contains(where: { $0.id == id }) }
-
-        if let snapshot = scanSnapshot {
-            let updatedItems = snapshot.items.filter { item in
-                let itemPath = URL(fileURLWithPath: item.path).standardizedFileURL.path
-                return itemPath != normalizedPath && itemPath.hasPrefix("\(normalizedPath)/") == false
-            }
-            scanSnapshot = ScanSnapshot(
-                target: snapshot.target,
-                items: updatedItems,
-                summaries: updatedItems.summaries(),
-                startedAt: snapshot.startedAt,
-                endedAt: .now,
-                totalMatchedBytes: updatedItems.reduce(into: Int64.zero) { $0 += $1.byteSize }
-            )
-        }
     }
 
     private func applyCleanupResult(_ result: CleanupResult, removedIDs: Set<String>) {
@@ -706,25 +818,43 @@ final class AppViewModel: ObservableObject {
         cleanupPlan = nil
         selectedItemIDs.subtract(removedIDs)
         focusedItemIDs.subtract(removedIDs)
-        items.removeAll { removedIDs.contains($0.id) }
-        if let snapshot = scanSnapshot {
-            let updatedItems = snapshot.items.filter { removedIDs.contains($0.id) == false }
-            scanSnapshot = ScanSnapshot(
-                target: snapshot.target,
-                items: updatedItems,
-                summaries: updatedItems.summaries(),
-                startedAt: snapshot.startedAt,
-                endedAt: .now,
-                totalMatchedBytes: updatedItems.reduce(into: Int64.zero) { $0 += $1.byteSize }
-            )
-        }
+
+        refreshAfterDataChange()
 
         statusMessage = result.failedItems.isEmpty
             ? "Cleaned \(result.reclaimedBytes.byteString) by moving items to Trash."
             : "Cleaned \(result.reclaimedBytes.byteString) with \(result.failedItems.count) items skipped."
 
-        appendHistoryEntry(matchedBytes: scanSnapshot?.totalMatchedBytes ?? 0, cleanedBytes: result.reclaimedBytes, itemCount: items.count)
+        let totalBytes = resultStore.totalMatchedBytes()
+        let count = resultStore.itemCount()
+        appendHistoryEntry(matchedBytes: totalBytes, cleanedBytes: result.reclaimedBytes, itemCount: count)
     }
+
+    /// Refreshes paginated display and summaries from SQLite after data mutations.
+    private func refreshAfterDataChange() {
+        categorySummariesCache = resultStore.categorySummaries()
+        totalItemCount = resultStore.totalCount(
+            category: selectedCategory,
+            searchText: searchText.isEmpty ? nil : searchText
+        )
+        reloadCurrentPage()
+
+        // Update snapshot counts
+        if let snapshot = scanSnapshot {
+            let newCount = resultStore.itemCount()
+            let newTotal = resultStore.totalMatchedBytes()
+            scanSnapshot = ScanSnapshot(
+                target: snapshot.target,
+                itemCount: newCount,
+                summaries: categorySummariesCache,
+                startedAt: snapshot.startedAt,
+                endedAt: .now,
+                totalMatchedBytes: newTotal
+            )
+        }
+    }
+
+    // MARK: - Progress Helpers
 
     private func progressDescription(_ progress: ScanProgress) -> String {
         switch progress.phase {
@@ -743,6 +873,15 @@ final class AppViewModel: ObservableObject {
             return "Scan complete."
         }
     }
+
+    private func shouldPublish(progress: ScanProgress) -> Bool {
+        if progress.phase != lastPublishedProgressPhase {
+            return true
+        }
+        return currentUptime - lastPublishedProgressAt >= progressPublishInterval
+    }
+
+    // MARK: - Persistence
 
     private func loadPersistedState() async {
         let state = await historyStore.load()
@@ -776,50 +915,10 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func shouldPublish(progress: ScanProgress) -> Bool {
-        if progress.phase != lastPublishedProgressPhase {
-            return true
-        }
-        return currentUptime - lastPublishedProgressAt >= progressPublishInterval
-    }
-
-    private func mergeSortedItems(existing: [ScanItem], incoming: [ScanItem]) -> [ScanItem] {
-        guard !existing.isEmpty else { return incoming }
-        guard !incoming.isEmpty else { return existing }
-
-        var merged: [ScanItem] = []
-        merged.reserveCapacity(existing.count + incoming.count)
-
-        var leftIndex = 0
-        var rightIndex = 0
-
-        while leftIndex < existing.count && rightIndex < incoming.count {
-            let left = existing[leftIndex]
-            let right = incoming[rightIndex]
-
-            if left.byteSize > right.byteSize || (left.byteSize == right.byteSize && left.path <= right.path) {
-                merged.append(left)
-                leftIndex += 1
-            } else {
-                merged.append(right)
-                rightIndex += 1
-            }
-        }
-
-        if leftIndex < existing.count {
-            merged.append(contentsOf: existing[leftIndex...])
-        }
-        if rightIndex < incoming.count {
-            merged.append(contentsOf: incoming[rightIndex...])
-        }
-
-        return merged
-    }
-
     private func presentCompletionBanner(for snapshot: ScanSnapshot) {
         let presentation = ScanCompletionPresentation(
             approach: activeScanApproach,
-            itemCount: snapshot.items.count,
+            itemCount: snapshot.itemCount,
             totalBytes: snapshot.totalMatchedBytes,
             categoryCount: snapshot.summaries.count
         )

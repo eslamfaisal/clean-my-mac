@@ -72,6 +72,16 @@ final class ScanClassifierTests: XCTestCase {
         XCTAssertEqual(result?.recommendation, .recommended)
     }
 
+    func testClassifiesGitDirectoryAsHiddenReviewItem() {
+        let classifier = makeClassifier()
+        let url = URL(fileURLWithPath: "/Users/dev/project/.git")
+        let result = classifier.classifyDirectory(at: url, rules: [])
+        XCTAssertEqual(result?.category, .other)
+        XCTAssertEqual(result?.recommendation, .manualInspection)
+        XCTAssertEqual(result?.toolchain, "Git")
+        XCTAssertTrue(result?.captureDirectory == true)
+    }
+
     func testReturnsNilForUnknownDirectory() {
         let classifier = makeClassifier()
         let url = URL(fileURLWithPath: "/Users/dev/Documents")
@@ -166,8 +176,8 @@ final class ScannerConfigurationTests: XCTestCase {
         let config = ScannerConfiguration.default()
         let safeURLs = [
             URL(fileURLWithPath: "/Users/dev/Documents"),
-            URL(fileURLWithPath: "/Applications"),
             URL(fileURLWithPath: "/Library/Caches"),
+            URL(fileURLWithPath: "/Users/dev/projects"),
         ]
         for url in safeURLs {
             XCTAssertFalse(
@@ -191,10 +201,10 @@ final class ScannerConfigurationTests: XCTestCase {
         XCTAssertTrue(config.shouldSkipTraversal(at: url, isDirectory: false, rules: rules))
     }
 
-    func testGitDirectoryIsSkipped() {
+    func testGitDirectoryIsNotSkipped() {
         let config = ScannerConfiguration.default()
         let url = URL(fileURLWithPath: "/Users/dev/project/.git")
-        XCTAssertTrue(config.shouldSkipTraversal(at: url, isDirectory: true, rules: []))
+        XCTAssertFalse(config.shouldSkipTraversal(at: url, isDirectory: true, rules: []))
     }
 
     func testCategoryIsDisabled() {

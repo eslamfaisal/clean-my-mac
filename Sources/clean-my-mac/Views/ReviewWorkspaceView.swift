@@ -19,12 +19,20 @@ struct ReviewWorkspaceView: View {
 
             VStack(alignment: .leading, spacing: 18) {
                 header(compact: compact)
-                filterBar
-                itemTable
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                if viewModel.isScanning {
+                    scanInProgressState
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    filterBar
+                    itemTable
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
             }
             .frame(maxWidth: 1180, maxHeight: .infinity, alignment: .topLeading)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .onChange(of: viewModel.searchText) {
+                viewModel.reloadCurrentPage()
+            }
         }
     }
 
@@ -73,6 +81,51 @@ struct ReviewWorkspaceView: View {
         .glassCard()
     }
 
+    private var scanInProgressState: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            TagPill(title: "Scan In Progress", tint: AppPalette.secondaryAccent)
+
+            Text("Review results unlock after the active scan finishes.")
+                .font(.system(size: 28, weight: .bold, design: .rounded))
+
+            Text("The review grid is paused during scanning to keep the app responsive and avoid crashes while the filesystem pass is still running.")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 10) {
+                statusRow("Phase", value: viewModel.scanPhaseTitle)
+                statusRow("Visited", value: (viewModel.scanProgress?.processedEntries ?? 0).formatted())
+                statusRow("Flagged", value: (viewModel.scanProgress?.matchedItems ?? 0).formatted())
+                statusRow("Scope", value: viewModel.activeScanApproach.title)
+            }
+
+            if let currentPath = viewModel.scanProgress?.currentPath, !currentPath.isEmpty {
+                Text(currentPath)
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            HStack(spacing: 12) {
+                Button("Back to Dashboard") {
+                    viewModel.selectedSection = .dashboard
+                }
+                .buttonStyle(.bordered)
+
+                Button("Cancel Scan") {
+                    viewModel.cancelScan()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .glassCard()
+    }
+
     private var itemTable: some View {
         VStack(alignment: .leading, spacing: 14) {
             if viewModel.visibleItems.isEmpty {
@@ -95,12 +148,41 @@ struct ReviewWorkspaceView: View {
                         LazyVStack(spacing: 0) {
                             ForEach(viewModel.visibleItems) { item in
                                 reviewRow(item)
+                                    .onAppear {
+                                        // Infinite scroll: load next page when last item appears
+                                        if item.id == viewModel.visibleItems.last?.id {
+                                            viewModel.loadMoreItems()
+                                        }
+                                    }
+                            }
+
+                            if viewModel.hasMoreItems {
+                                HStack {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Loading more items…")
+                                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
                             }
                         }
                         .frame(minWidth: tableWidth, alignment: .topLeading)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(AppPalette.tile.opacity(0.2))
+
+                    if viewModel.totalItemCount > 0 {
+                        HStack {
+                            Text("Showing \(viewModel.visibleItems.count) of \(viewModel.totalItemCount) items")
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                    }
                 }
                 .frame(minHeight: 420, maxHeight: .infinity)
                 .padding(18)
@@ -317,6 +399,17 @@ struct ReviewWorkspaceView: View {
             .padding(.vertical, 10)
             .padding(.horizontal, 10)
             .frame(width: width, alignment: alignment)
+    }
+
+    private func statusRow(_ title: String, value: String) -> some View {
+        HStack {
+            Text(title)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .fontWeight(.semibold)
+                .monospacedDigit()
+        }
     }
 
     private func cell<Content: View>(

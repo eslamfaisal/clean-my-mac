@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ScanActivityOverlay: View {
     @ObservedObject var viewModel: AppViewModel
+    let onMinimize: () -> Void
     @State private var shimmerPhase: CGFloat = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -17,6 +18,7 @@ struct ScanActivityOverlay: View {
                         TagPill(title: viewModel.activeScanApproach.title, tint: AppPalette.secondaryAccent)
                         TagPill(title: viewModel.scanProgress?.phase.rawValue.capitalized ?? "Preparing", tint: AppPalette.accent)
                         Spacer()
+                        minimizeButton
                         cancelButton
                     }
 
@@ -142,6 +144,72 @@ struct ScanActivityOverlay: View {
         }
         .buttonStyle(.plain)
         .help("Cancel the active scan")
+    }
+
+    private var minimizeButton: some View {
+        Button {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                onMinimize()
+            }
+        } label: {
+            Image(systemName: "minus.circle")
+                .font(.system(size: 15, weight: .bold))
+                .foregroundStyle(.secondary)
+                .frame(width: 30, height: 30)
+                .background(
+                    Circle()
+                        .fill(AppPalette.tile.opacity(0.95))
+                )
+        }
+        .buttonStyle(.plain)
+        .help("Minimize scan overlay")
+    }
+}
+
+struct MinimizedScanOverlay: View {
+    @ObservedObject var viewModel: AppViewModel
+    let onExpand: () -> Void
+
+    var body: some View {
+        Button {
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.82)) {
+                onExpand()
+            }
+        } label: {
+            HStack(spacing: 12) {
+                ToolbarScannerGlyph(progress: viewModel.scanPhaseFraction)
+                    .frame(width: 24, height: 24)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(viewModel.scanPhaseTitle)
+                        .font(.system(size: 13, weight: .bold, design: .rounded))
+                        .lineLimit(1)
+                    Text("\((viewModel.scanProgress?.processedEntries ?? 0).formatted()) visited · \((viewModel.scanProgress?.matchedItems ?? 0).formatted()) flagged")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .frame(maxWidth: 360)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(AppPalette.surfaceRaised.opacity(0.96))
+                    .overlay(
+                        Capsule(style: .continuous)
+                            .strokeBorder(AppPalette.secondaryAccent.opacity(0.20), lineWidth: 1)
+                    )
+            )
+        }
+        .buttonStyle(.plain)
+        .help("Expand scan overlay")
     }
 }
 

@@ -431,7 +431,7 @@ struct ScanProgress: Codable, Hashable, Sendable {
 
 struct ScanSnapshot: Codable, Hashable, Sendable {
     let target: ScanTarget
-    let items: [ScanItem]
+    let itemCount: Int
     let summaries: [CategorySummary]
     let startedAt: Date
     let endedAt: Date
@@ -447,43 +447,4 @@ enum ScanEvent: Sendable {
     case cancelled
 }
 
-extension Array where Element == ScanItem {
-    func summaries() -> [CategorySummary] {
-        ScanCategory.allCases.compactMap { category in
-            let items = filter { $0.category == category }
-            guard !items.isEmpty else { return nil }
 
-            let total = items.reduce(into: Int64.zero) { $0 += $1.byteSize }
-            let recommended = items
-                .filter { $0.recommendation == .recommended }
-                .reduce(into: Int64.zero) { $0 += $1.byteSize }
-
-            let highestRisk = items.map(\.risk).max(by: Self.riskRank) ?? .low
-
-            return CategorySummary(
-                category: category,
-                itemCount: items.count,
-                totalBytes: total,
-                reclaimableBytes: total,
-                recommendedBytes: recommended,
-                highestRisk: highestRisk
-            )
-        }
-        .sorted { $0.totalBytes > $1.totalBytes }
-    }
-
-    private static func riskRank(lhs: ScanRisk, rhs: ScanRisk) -> Bool {
-        rank(lhs) < rank(rhs)
-    }
-
-    private static func rank(_ risk: ScanRisk) -> Int {
-        switch risk {
-        case .low:
-            return 0
-        case .medium:
-            return 1
-        case .high:
-            return 2
-        }
-    }
-}

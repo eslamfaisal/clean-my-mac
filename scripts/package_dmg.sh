@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 
 APP_NAME="CleanMyMac"
 BUNDLE_ID="com.eslam.cleanmymac"
-VERSION="0.0.2"
+VERSION="0.0.3"
 MIN_MACOS="14.0"
 BUILD_DIR="$ROOT_DIR/.build"
 RELEASE_DIR="$BUILD_DIR/arm64-apple-macosx/release"
@@ -69,9 +69,27 @@ EOF
 printf 'APPL????' > "$APP_BUNDLE/Contents/PkgInfo"
 
 cp -R "$APP_BUNDLE" "$STAGING_DIR/"
-ln -s /Applications "$STAGING_DIR/Applications"
 
-cat > "$STAGING_DIR/README.txt" <<EOF
+create_applications_alias() {
+  rm -f "$STAGING_DIR/Applications"
+
+  if osascript <<EOF >/dev/null 2>&1
+tell application "Finder"
+  set stagingFolder to POSIX file "$STAGING_DIR" as alias
+  set appsAlias to make new alias file to POSIX file "/Applications" at stagingFolder
+  set name of appsAlias to "Applications"
+end tell
+EOF
+  then
+    return 0
+  fi
+
+  ln -s /Applications "$STAGING_DIR/Applications"
+}
+
+create_applications_alias
+
+cat > "$STAGING_DIR/Install CleanMyMac.txt" <<EOF
 $APP_NAME
 
 1. Drag $APP_NAME.app into Applications.
@@ -81,6 +99,9 @@ $APP_NAME
 
 This DMG is locally packaged and ad-hoc signed for personal installation.
 EOF
+
+cp "$ROOT_DIR/Resources/AppIcon.icns" "$STAGING_DIR/.VolumeIcon.icns"
+SetFile -a C "$STAGING_DIR" || true
 
 codesign --force --deep --sign - "$APP_BUNDLE"
 codesign --verify --deep --strict "$APP_BUNDLE"

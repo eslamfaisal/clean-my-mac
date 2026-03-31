@@ -5,6 +5,7 @@ struct AppShellView: View {
     @ObservedObject var viewModel: AppViewModel
     @AppStorage("layout.sidebarVisible") private var isSidebarVisible = true
     @AppStorage("layout.inspectorVisible") private var isInspectorVisible = true
+    @AppStorage("layout.scanOverlayMinimized") private var isScanOverlayMinimized = false
     @State private var isPermissionAlertPresented = false
 
     var body: some View {
@@ -116,7 +117,7 @@ struct AppShellView: View {
                         viewModel.selectRecommendedItems()
                     }
                     .frame(width: 112)
-                    .disabled(viewModel.items.isEmpty || viewModel.isScanning)
+                    .disabled(viewModel.totalItemCount == 0 || viewModel.isScanning)
 
                     Button(viewModel.isScanning ? "Cancel Scan" : "Scan Mac") {
                         viewModel.isScanning ? viewModel.cancelScan() : viewModel.presentScanSetup()
@@ -136,10 +137,20 @@ struct AppShellView: View {
             if viewModel.isScanning {
                 VStack {
                     Spacer()
-                    ScanActivityOverlay(viewModel: viewModel)
-                        .padding(.horizontal, 24)
-                        .padding(.bottom, 22)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    Group {
+                        if isScanOverlayMinimized {
+                            MinimizedScanOverlay(viewModel: viewModel) {
+                                isScanOverlayMinimized = false
+                            }
+                        } else {
+                            ScanActivityOverlay(viewModel: viewModel) {
+                                isScanOverlayMinimized = true
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 22)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
                 .zIndex(2)
             }
@@ -164,6 +175,11 @@ struct AppShellView: View {
         .sheet(isPresented: $viewModel.isScanSetupPresented) {
             ScanSetupSheetView(viewModel: viewModel)
                 .frame(minWidth: 880, minHeight: 720)
+        }
+        .onChange(of: viewModel.isScanning) { _, isScanning in
+            if !isScanning {
+                isScanOverlayMinimized = false
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             viewModel.refreshPermissions()

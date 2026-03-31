@@ -24,6 +24,12 @@ struct FileSystemScanner: ScanStreaming, Sendable {
         let averageBytesPerEntry: Int64
     }
 
+    /// Hard cap on matched items per scan to prevent unbounded memory growth.
+    static let maxMatchedItems = 50_000
+
+    /// Memory pressure ceiling in bytes (2 GB). Scan aborts gracefully above this.
+    static let memoryPressureCeiling: UInt64 = 2 * 1_024 * 1_024 * 1_024
+
     func scan(target: ScanTarget, rules: [UserRule]) -> AsyncThrowingStream<ScanEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [configuration, classifier] in
@@ -74,12 +80,17 @@ struct FileSystemScanner: ScanStreaming, Sendable {
         ]
 
         let startedAt = Date()
-        var itemsByPath: [String: ScanItem] = [:]
+
+        // Lightweight dedup tracker — stores only path strings, not full ScanItem objects.
+        var seenPaths: Set<String> = []
         var processedEntries = 0
         var matchedItems = 0
+        var totalMatchedBytes: Int64 = 0
         var lastProgressYieldAt = ProcessInfo.processInfo.systemUptime
         let progressEmissionInterval: TimeInterval = 0.16
         let progressEmissionEntryStride = 420
+        var memoryCheckCounter = 0
+        let memoryCheckInterval = 5_000
 
         continuation.yield(.progress(ScanProgress(
             phase: .inventory,
@@ -103,6 +114,28 @@ struct FileSystemScanner: ScanStreaming, Sendable {
 
             while let url = enumerator.nextObject() as? URL {
                 try Task.checkCancellation()
+
+                // Memory pressure check every N entries
+                memoryCheckCounter += 1
+                if memoryCheckCounter % memoryCheckInterval == 0 {
+                    if isMemoryPressureExceeded() {
+                        continuation.yield(.failed("Scan aborted: memory pressure exceeded safe limit (\(memoryPressureCeiling / (1_024 * 1_024)) MB). Try a narrower scan scope."))
+                        throw CancellationError()
+                    }
+                }
+
+                // Hard cap on matched items
+                if matchedItems >= maxMatchedItems {
+                    continuation.yield(.progress(ScanProgress(
+                        phase: .detection,
+                        processedEntries: processedEntries,
+                        matchedItems: matchedItems,
+                        currentPath: "Item limit reached (\(maxMatchedItems))",
+                        currentCategory: nil
+                    )))
+                    break
+                }
+
                 try autoreleasepool {
                     let values = try? url.resourceValues(forKeys: keys)
                     let isDirectory = values?.isDirectory ?? false
@@ -143,10 +176,11 @@ struct FileSystemScanner: ScanStreaming, Sendable {
                                 return
                             }
 
+                            let standardizedPath = url.standardizedFileURL.path
                             let kind: ScanItemKind = (values?.isPackage ?? false) ? .package : .directory
                             let item = ScanItem(
-                                id: url.standardizedFileURL.path,
-                                path: url.standardizedFileURL.path,
+                                id: standardizedPath,
+                                path: standardizedPath,
                                 kind: kind,
                                 byteSize: metrics.byteSize,
                                 lastUsedDate: values?.contentAccessDate,
@@ -160,9 +194,9 @@ struct FileSystemScanner: ScanStreaming, Sendable {
                                 capturedChildCount: metrics.childCount
                             )
 
-                            if itemsByPath[item.path] == nil {
-                                itemsByPath[item.path] = item
+                            if seenPaths.insert(standardizedPath).inserted {
                                 matchedItems += 1
+                                totalMatchedBytes += metrics.byteSize
                                 continuation.yield(.item(item))
                             }
 
@@ -185,9 +219,10 @@ struct FileSystemScanner: ScanStreaming, Sendable {
                     guard size > 0 else { return }
 
                     if let decision = classifier.classifyFile(at: url, size: size, modifiedAt: values?.contentModificationDate ?? values?.creationDate, rules: rules) {
+                        let standardizedPath = url.standardizedFileURL.path
                         let item = ScanItem(
-                            id: url.standardizedFileURL.path,
-                            path: url.standardizedFileURL.path,
+                            id: standardizedPath,
+                            path: standardizedPath,
                             kind: .file,
                             byteSize: size,
                             lastUsedDate: values?.contentAccessDate,
@@ -199,15 +234,18 @@ struct FileSystemScanner: ScanStreaming, Sendable {
                             reason: decision.reason
                         )
 
-                        if itemsByPath[item.path] == nil {
-                            itemsByPath[item.path] = item
+                        if seenPaths.insert(standardizedPath).inserted {
                             matchedItems += 1
+                            totalMatchedBytes += size
                             continuation.yield(.item(item))
                         }
                     }
                 }
             }
         }
+
+        // Release the dedup set immediately — no longer needed
+        seenPaths.removeAll()
 
         continuation.yield(.progress(ScanProgress(
             phase: .aggregation,
@@ -217,24 +255,33 @@ struct FileSystemScanner: ScanStreaming, Sendable {
             currentCategory: nil
         )))
 
-        let items = itemsByPath.values.sorted { lhs, rhs in
-            if lhs.byteSize == rhs.byteSize {
-                return lhs.path < rhs.path
-            }
-            return lhs.byteSize > rhs.byteSize
-        }
-        let summaries = items.summaries()
-        let total = items.reduce(into: Int64.zero) { $0 += $1.byteSize }
-
+        // Lightweight snapshot — no items array, just metadata.
+        // Summaries will be computed from SQLite by the ViewModel.
         return ScanSnapshot(
             target: target,
-            items: items,
-            summaries: summaries,
+            itemCount: matchedItems,
+            summaries: [],
             startedAt: startedAt,
             endedAt: .now,
-            totalMatchedBytes: total
+            totalMatchedBytes: totalMatchedBytes
         )
     }
+
+    // MARK: - Memory Pressure
+
+    private static func isMemoryPressureExceeded() -> Bool {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return false }
+        return info.resident_size > memoryPressureCeiling
+    }
+
+    // MARK: - Directory Sizing (with autoreleasepool)
 
     private static func directorySize(at url: URL, fileManager: FileManager) throws -> Int64 {
         let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey]
@@ -248,11 +295,23 @@ struct FileSystemScanner: ScanStreaming, Sendable {
         }
 
         var total: Int64 = 0
+        var batchCount = 0
+        let drainInterval = 500
+
         while let nestedURL = enumerator.nextObject() as? URL {
             try Task.checkCancellation()
-            let values = try? nestedURL.resourceValues(forKeys: resourceKeys)
-            guard values?.isRegularFile == true else { continue }
-            total += fileByteSize(at: nestedURL, values: values, fileManager: fileManager)
+
+            batchCount += 1
+            if batchCount % drainInterval == 0 {
+                // Force autoreleasepool drain every N iterations to prevent URL/resource object accumulation
+                autoreleasepool {}
+            }
+
+            autoreleasepool {
+                let values = try? nestedURL.resourceValues(forKeys: resourceKeys)
+                guard values?.isRegularFile == true else { return }
+                total += fileByteSize(at: nestedURL, values: values, fileManager: fileManager)
+            }
         }
         return total
     }
@@ -306,9 +365,11 @@ struct FileSystemScanner: ScanStreaming, Sendable {
         var directFileBytes: Int64 = 0
         for childURL in childURLs {
             try Task.checkCancellation()
-            let childValues = try? childURL.resourceValues(forKeys: resourceKeys)
-            guard childValues?.isRegularFile == true else { continue }
-            directFileBytes += fileByteSize(at: childURL, values: childValues, fileManager: fileManager)
+            autoreleasepool {
+                let childValues = try? childURL.resourceValues(forKeys: resourceKeys)
+                guard childValues?.isRegularFile == true else { return }
+                directFileBytes += fileByteSize(at: childURL, values: childValues, fileManager: fileManager)
+            }
         }
 
         let childCount = values?.directoryEntryCount ?? childURLs.count
@@ -343,7 +404,7 @@ struct FileSystemScanner: ScanStreaming, Sendable {
             return FolderEstimatePolicy(minimumBytes: 96 * 1_024 * 1_024, averageBytesPerEntry: 8 * 1_024 * 1_024)
         }
 
-        if [".build", "build", "dist", "out", "release", "debug", "target", "flutter_build", "intermediates", ".cxx", ".next", ".nuxt", ".svelte-kit", ".output", "storybook-static", "bazel-out", "bazel-bin", "bazel-testlogs", "cmakefiles"].contains(name) || name.hasPrefix("cmake-build-") {
+        if ["build", "dist", "out", "release", "debug", "target", "flutter_build", "intermediates", ".cxx", ".next", ".nuxt", ".svelte-kit", ".output", "storybook-static", "bazel-out", "bazel-bin", "bazel-testlogs", "cmakefiles"].contains(name) || name.hasPrefix("cmake-build-") {
             return FolderEstimatePolicy(minimumBytes: 192 * 1_024 * 1_024, averageBytesPerEntry: 24 * 1_024 * 1_024)
         }
 

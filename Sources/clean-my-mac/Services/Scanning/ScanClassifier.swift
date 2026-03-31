@@ -44,7 +44,7 @@ struct ScanClassifier: Sendable {
                 toolchain: inferredToolchain(for: lowercasedPath, default: nil),
                 reason: "Log directories often accumulate stale diagnostic files.",
                 captureDirectory: true,
-                directorySizing: .recursiveExact
+                directorySizing: .estimatedFastFolder
             )
         }
 
@@ -57,8 +57,12 @@ struct ScanClassifier: Sendable {
                 toolchain: nil,
                 reason: "Items already live in Trash and are usually safe to clear.",
                 captureDirectory: true,
-                directorySizing: .recursiveExact
+                directorySizing: .estimatedFastFolder
             )
+        }
+
+        if let decision = hiddenDirectoryDecision(for: lowercasedPath, name: name, rules: rules) {
+            return decision
         }
 
         return nil
@@ -239,7 +243,7 @@ struct ScanClassifier: Sendable {
             )
         }
 
-        if name == ".dart_tool" || name == ".pub-cache" {
+        if name == ".dart_tool" || name == ".dart_tools" || name == ".pub-cache" {
             return ClassificationDecision(
                 category: .devCaches,
                 risk: .low,
@@ -330,6 +334,41 @@ struct ScanClassifier: Sendable {
         }
 
         return nil
+    }
+
+    private func hiddenDirectoryDecision(for lowercasedPath: String, name: String, rules: [UserRule]) -> ClassificationDecision? {
+        guard name.hasPrefix(".") else { return nil }
+        let inferred = inferredToolchain(for: lowercasedPath, default: nil)
+
+        if name == ".git" {
+            return ClassificationDecision(
+                category: .other,
+                risk: .high,
+                recommendation: .manualInspection,
+                toolchain: "Git",
+                reason: "Git repository metadata is captured as a single hidden folder for review. Descendants are skipped for performance because removing it would destroy repository history.",
+                captureDirectory: true,
+                directorySizing: .estimatedFastFolder
+            )
+        }
+
+        if inferred == nil, configuration.categoryIsDisabled(.other, rules: rules) {
+            return nil
+        }
+
+        if inferred != nil, configuration.categoryIsDisabled(.devCaches, rules: rules) {
+            return nil
+        }
+
+        return ClassificationDecision(
+            category: inferred == nil ? .other : .devCaches,
+            risk: inferred == nil ? .medium : .low,
+            recommendation: inferred == nil ? .review : .recommended,
+            toolchain: inferred ?? "Hidden Folder",
+            reason: "Hidden folders are captured once and their descendants are skipped so the scanner can show their footprint without walking thousands of nested files.",
+            captureDirectory: true,
+            directorySizing: .estimatedFastFolder
+        )
     }
 
     private func inferredToolchain(for path: String, default defaultToolchain: String?) -> String? {
